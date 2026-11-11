@@ -43,7 +43,16 @@ Built for a UK shop shipping with Royal Mail, but the carrier names and shipping
 - **Optional note to the buyer** sent with the dispatch email (see [Dispatch note](#dispatch-note)).
 - Supports several parcels per order: each tracking number is sent once.
 
-### 3. A local order database
+### 3. Etsy → Shopify: labels bought on Etsy
+
+Runs automatically at the start of every sync, with either shortcut.
+
+- If you buy a label on Etsy instead of Shopify (or mark an order dispatched there by hand), the Shopify copy of the order is marked **fulfilled**, with the tracking number Etsy holds.
+- Shopify sends the buyer no email for this.
+- The order is recorded as shipped, so that tracking number is never sent back to Etsy.
+- `--dry-run` lists the orders that would be marked fulfilled without changing Shopify.
+
+### 4. A local order database
 
 Everything is recorded in `orders.db` (SQLite), one row per Etsy order: status, Shopify order ID, tracking, order date, buyer name, address, items, totals, discount, postage upgrade, gift details and dispatch date.
 
@@ -53,7 +62,7 @@ Everything is recorded in `orders.db` (SQLite), one row per Etsy order: status, 
 
 Etsy's API does not provide buyer email addresses, so the email column stays empty. Nothing in the sync needs it.
 
-### 4. Housekeeping on every run
+### 5. Housekeeping on every run
 
 - **Due list:** orders due today or overdue that are still not dispatched on Etsy.
 - **Run log:** everything printed is also saved to `logs/YYYY-MM-DD.log` (kept for 90 days).

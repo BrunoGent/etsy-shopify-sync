@@ -1187,6 +1187,102 @@ def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False):
 
 
 # =====================================================================
+# STEP 3: ETSY -> SHOPIFY DISPATCH (labels bought on Etsy)
+# =====================================================================
+
+def fulfill_shopify_order(shopify_order_id, tracking_code, carrier):
+    """Marks every open fulfillment order of a Shopify order as fulfilled, without emailing
+    the customer. Returns 'fulfilled', 'already' (nothing left to fulfil) or 'failed'."""
+    base = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}"
+    resp = shopify_request("GET", f"{base}/orders/{shopify_order_id}/fulfillment_orders.json")
+    if resp.status_code != 200:
+        print(f"  [!] Could not read fulfillment orders for Shopify ID {shopify_order_id} "
+              f"({resp.status_code}): {resp.text}")
+        return "failed"
+    open_ids = [fo["id"] for fo in resp.json().get("fulfillment_orders", [])
+                if fo.get("status") in ("open", "in_progress")]
+    if not open_ids:
+        return "already"
+
+    fulfillment = {
+        "line_items_by_fulfillment_order": [{"fulfillment_order_id": fo_id} for fo_id in open_ids],
+        "notify_customer": False,
+    }
+    if tracking_code:
+        fulfillment["tracking_info"] = {"number": tracking_code, "company": carrier or "Other"}
+    resp = shopify_request("POST", f"{base}/fulfillments.json", json={"fulfillment": fulfillment})
+    if resp.status_code not in (200, 201):
+        print(f"  [!] Could not fulfil Shopify ID {shopify_order_id} ({resp.status_code}): {resp.text}")
+        return "failed"
+    return "fulfilled"
+
+
+def sync_etsy_dispatch_to_shopify(dry_run=False):
+    """For orders whose label was bought on Etsy: marks the Shopify copy as fulfilled.
+
+    Looks at orders that are in Shopify but have no dispatch recorded here, asks Etsy
+    whether each is already dispatched, and if so fulfils it in Shopify with Etsy's
+    tracking number. The order is then recorded as SHIPPED so the tracking sync never
+    sends that tracking back to Etsy.
+    """
+    print(f"\n--- Checking Etsy Dispatches to Mark Fulfilled in Shopify (Dry Run: {dry_run}) ---")
+    rows = _db_query("""
+        SELECT etsy_receipt_id, shopify_order_id FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+        ORDER BY synced_at DESC LIMIT 300
+    """)
+    fulfilled, already, failed = 0, 0, 0
+
+    for receipt_id, shopify_id in rows:
+        shopify_id = _numeric_id(shopify_id)
+        if not shopify_id:
+            continue
+        url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts/{receipt_id}"
+        try:
+            resp = etsy_request("GET", url)
+            time.sleep(0.15)
+            if resp.status_code != 200:
+                print(f"  [!] Could not check Etsy #{receipt_id}: {resp.status_code} -> {resp.text}")
+                failed += 1
+                continue
+            receipt = resp.json()
+            if not receipt.get("is_shipped"):
+                continue
+
+            shipments = [s for s in receipt.get("shipments") or [] if str(s.get("tracking_code") or "").strip()]
+            codes = [str(s["tracking_code"]).strip() for s in shipments]
+            tracking_code = codes[0] if codes else ""
+            carrier = str(shipments[0].get("carrier_name") or "") if shipments else ""
+            shown = f"{tracking_code} ({carrier or 'no carrier'})" if tracking_code else "no tracking number"
+
+            if dry_run:
+                print(f"  [DRY RUN] Would mark Shopify order for Etsy #{receipt_id} as fulfilled -> {shown}")
+                fulfilled += 1
+                continue
+
+            result = fulfill_shopify_order(shopify_id, tracking_code, carrier)
+            if result == "failed":
+                failed += 1
+                continue
+            if result == "fulfilled":
+                print(f"  [+] Etsy #{receipt_id} was dispatched on Etsy; Shopify order marked fulfilled -> {shown}")
+                fulfilled += 1
+            else:
+                print(f"  [-] Etsy #{receipt_id} was dispatched on Etsy and is already fulfilled in Shopify (Saved to DB)")
+                already += 1
+            # Record every Etsy code as pushed so the tracking sync leaves this order alone.
+            for code in codes or [""]:
+                record_tracking_pushed(receipt_id, code, shopify_id)
+            save_order_details(receipt)
+        except Exception as e:
+            print(f"  [!] Failed #{receipt_id}: {e}")
+            failed += 1
+
+    print(f"Etsy Dispatch Summary -> Marked fulfilled in Shopify: {fulfilled} | "
+          f"Already fulfilled: {already} | Failed: {failed}")
+
+
+# =====================================================================
 # HOUSEKEEPING: RUN LOG, DUE LIST, BACKUP
 # =====================================================================
 
@@ -1285,6 +1381,7 @@ def main(argv=None):
         if (args.import_orders or args.backfill_deadlines) and not args.tracking_only:
             import_etsy_orders(args)
 
+        sync_etsy_dispatch_to_shopify(dry_run=args.dry_run)
         sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch)
         print_due_orders()
         if not args.dry_run:
