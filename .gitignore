@@ -1,0 +1,10 @@
+# Secrets and tokens
+.env
+
+# Local database
+orders.db
+*.db
+
+# Python cache
+__pycache__/
+*.py[cod]
