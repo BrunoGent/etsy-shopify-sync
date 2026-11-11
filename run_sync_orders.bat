@@ -1,5 +1,5 @@
 @echo off
-cd /d "C:\etsy-shopify-sync"
+cd /d "%~dp0"
 python sync.py --import-orders
 echo.
 pause

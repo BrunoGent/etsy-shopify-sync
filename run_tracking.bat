@@ -1,5 +1,5 @@
 @echo off
-cd /d "C:\etsy-shopify-sync"
-python push_all_tracking.py
+cd /d "%~dp0"
+python sync.py --tracking-only
 echo.
 pause

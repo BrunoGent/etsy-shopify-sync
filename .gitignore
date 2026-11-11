@@ -1,9 +1,24 @@
 # Secrets and tokens
 .env
 
-# Local database
+# Local database and its backups (customer data)
 orders.db
 *.db
+*.db-journal
+*.db.tmp
+
+# Run logs and exports (contain customer names)
+logs/
+*.csv
+
+# Your own dispatch message (dispatch_note.example.txt is the shared template)
+dispatch_note.txt
+
+# Private project notes
+CLAUDE.md
+
+# Editor settings
+.vscode/
 
 # Python cache
 __pycache__/

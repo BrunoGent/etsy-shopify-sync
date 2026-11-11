@@ -4,15 +4,27 @@ import sys
 import time
 import sqlite3
 import argparse
-from datetime import datetime, timezone
+import traceback
+from contextlib import closing
+from datetime import date, datetime, timezone
 import requests
 from dotenv import load_dotenv, set_key
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(ENV_PATH)
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "orders.db")
-SHOPIFY_API_VERSION = "2024-10"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "orders.db")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+DISPATCH_NOTE_PATH = os.path.join(BASE_DIR, "dispatch_note.txt")
+# 2026-01 is the version Shopify was already serving this app. Override in .env to test a newer one.
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "").strip("'\" ") or "2026-01"
+# Optional: a folder that syncs to the cloud (Google Drive, OneDrive, Dropbox...). See README.
+DEFAULT_BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+# With no BACKUP_DIR set, backups still happen, into a "backups" folder next to this script.
+BACKUP_DIR = os.getenv("BACKUP_DIR", "").strip("'\" ") or DEFAULT_BACKUP_DIR
+BACKUP_KEEP = 30
+LOG_KEEP_DAYS = 90
 
 # --- Credentials ---
 ETSY_KEYSTRING = os.getenv("ETSY_KEYSTRING", "").strip("'\"")
@@ -20,6 +32,10 @@ ETSY_SHARED_SECRET = os.getenv("ETSY_SHARED_SECRET", "").strip("'\"")
 ETSY_ACCESS_TOKEN = os.getenv("ETSY_ACCESS_TOKEN", "").strip("'\"")
 ETSY_REFRESH_TOKEN = os.getenv("ETSY_REFRESH_TOKEN", "").strip("'\"")
 ETSY_SHOP_ID = os.getenv("ETSY_SHOP_ID", "").strip("'\"")
+try:
+    ETSY_TOKEN_EXPIRES_AT = int(os.getenv("ETSY_TOKEN_EXPIRES_AT", "0").strip("'\"") or 0)
+except ValueError:
+    ETSY_TOKEN_EXPIRES_AT = 0
 
 SHOPIFY_SHOP_URL = os.getenv("SHOPIFY_SHOP_URL", "").strip("'\"")
 SHOPIFY_CLIENT_ID = os.getenv("SHOPIFY_CLIENT_ID", "").strip("'\"")
@@ -28,105 +44,180 @@ SHOPIFY_CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET", "").strip("'\"")
 cached_shopify_token = None
 cached_shopify_token_expires = 0
 
+HOME_COUNTRY = "GB"
+EXPRESS_KEYWORDS = ("24", "express", "first", "1st", "next day", "priority")
+CANCELLED_TAG = "Etsy Cancelled"
+
+# Order detail columns on synced_orders, filled by save_order_details() for new orders
+# (during import) and for past orders (backfill_orders.py). The sync never reads these
+# to make decisions; they are a record of the order as Etsy described it.
+ORDER_DETAIL_COLUMNS = {
+    "order_date": "TEXT",          # purchase time, UTC, YYYY-MM-DD HH:MM:SS
+    "etsy_status": "TEXT",         # Etsy's own status: Paid, Completed, Canceled, ...
+    "buyer_name": "TEXT",
+    "buyer_email": "TEXT",
+    "address_line1": "TEXT",
+    "address_line2": "TEXT",
+    "city": "TEXT",
+    "county": "TEXT",
+    "postcode": "TEXT",
+    "country": "TEXT",
+    "items": "TEXT",               # one line per item: "2x Title [SKU] (Option: value)"
+    "item_count": "INTEGER",
+    "items_total": "REAL",
+    "shipping_cost": "REAL",
+    "discount": "REAL",
+    "tax": "REAL",
+    "grand_total": "REAL",
+    "currency": "TEXT",
+    "shipping_upgrade": "TEXT",
+    "is_gift": "INTEGER",
+    "gift_message": "TEXT",
+    "buyer_note": "TEXT",
+    "shipped_date": "TEXT",        # when Etsy was told it was dispatched, UTC
+    "etsy_tracking": "TEXT",       # tracking code(s) Etsy holds for the order
+    "details_updated_at": "TIMESTAMP",
+}
+
 
 # =====================================================================
 # DATABASE MANAGEMENT (SQLite)
 # =====================================================================
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS synced_orders (
-            etsy_receipt_id TEXT PRIMARY KEY,
-            shopify_order_id TEXT,
-            synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            status TEXT,
-            tracking_number TEXT,
-            tracking_pushed INTEGER DEFAULT 0
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS etsy_emails (
-            receipt_id TEXT PRIMARY KEY,
-            email TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("PRAGMA table_info(synced_orders)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "tracking_number" not in columns:
-        cursor.execute("ALTER TABLE synced_orders ADD COLUMN tracking_number TEXT")
-    if "tracking_pushed" not in columns:
-        cursor.execute("ALTER TABLE synced_orders ADD COLUMN tracking_pushed INTEGER DEFAULT 0")
+def _db_execute(sql, params=(), fetch=False):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cursor = conn.execute(sql, params)
+        row = cursor.fetchone() if fetch else None
+        conn.commit()
+        return row
 
-    conn.commit()
-    conn.close()
+
+def _db_query(sql, params=()):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS synced_orders (
+                etsy_receipt_id TEXT PRIMARY KEY,
+                shopify_order_id TEXT,
+                synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT,
+                tracking_number TEXT,
+                tracking_pushed INTEGER DEFAULT 0,
+                expected_ship_date TEXT,
+                tracking_pushed_at TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS etsy_emails (
+                receipt_id TEXT PRIMARY KEY,
+                email TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("PRAGMA table_info(synced_orders)")
+        columns = [col[1] for col in cursor.fetchall()]
+        migrations = {
+            "tracking_number": "TEXT",
+            "tracking_pushed": "INTEGER DEFAULT 0",
+            "expected_ship_date": "TEXT",
+            "tracking_pushed_at": "TIMESTAMP",
+        }
+        migrations.update(ORDER_DETAIL_COLUMNS)
+        for name, ddl in migrations.items():
+            if name not in columns:
+                cursor.execute(f"ALTER TABLE synced_orders ADD COLUMN {name} {ddl}")
+        conn.commit()
 
 
 def get_cached_email(receipt_id):
     """Checks local SQLite etsy_emails table if populated by the browser extension."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT email FROM etsy_emails WHERE receipt_id = ?", (str(receipt_id),))
-    row = cursor.fetchone()
-    conn.close()
+    row = _db_execute("SELECT email FROM etsy_emails WHERE receipt_id = ?", (str(receipt_id),), fetch=True)
     return row[0].strip() if row and row[0] else ""
 
 
+def get_synced_row(receipt_id):
+    """Returns {shopify_order_id, status, expected_ship_date} for a receipt, or None."""
+    row = _db_execute(
+        "SELECT shopify_order_id, status, expected_ship_date FROM synced_orders WHERE etsy_receipt_id = ?",
+        (str(receipt_id),), fetch=True)
+    if not row:
+        return None
+    return {"shopify_order_id": row[0], "status": row[1], "expected_ship_date": row[2]}
+
+
 def is_order_synced(receipt_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM synced_orders WHERE etsy_receipt_id = ?", (str(receipt_id),))
-    row = cursor.fetchone()
-    conn.close()
-    return row is not None
+    return get_synced_row(receipt_id) is not None
+
+
+def record_synced_order(receipt_id, shopify_order_id, status="SUCCESS", expected_ship_date=None):
+    _db_execute("""
+        INSERT INTO synced_orders (etsy_receipt_id, shopify_order_id, status, expected_ship_date)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(etsy_receipt_id) DO UPDATE SET
+            shopify_order_id = excluded.shopify_order_id,
+            status = excluded.status,
+            expected_ship_date = COALESCE(excluded.expected_ship_date, synced_orders.expected_ship_date)
+    """, (str(receipt_id), str(shopify_order_id), status, expected_ship_date))
+
+
+def set_order_status(receipt_id, status):
+    _db_execute("UPDATE synced_orders SET status = ? WHERE etsy_receipt_id = ?", (status, str(receipt_id)))
+
+
+def set_expected_ship_date(receipt_id, expected_ship_date):
+    _db_execute("UPDATE synced_orders SET expected_ship_date = ? WHERE etsy_receipt_id = ?",
+                (expected_ship_date, str(receipt_id)))
+
+
+def get_tracking_state(receipt_id):
+    """Returns which tracking codes have already been pushed to Etsy for a receipt.
+
+    Rows pushed before multi-parcel support have no tracking_pushed_at; they are
+    treated as fully done so old orders are never re-notified.
+    """
+    row = _db_execute(
+        "SELECT tracking_pushed, tracking_number, tracking_pushed_at FROM synced_orders WHERE etsy_receipt_id = ?",
+        (str(receipt_id),), fetch=True)
+    if not row or row[0] != 1:
+        return {"legacy_done": False, "codes": set()}
+    codes = {c.strip() for c in (row[1] or "").split(",") if c.strip()}
+    return {"legacy_done": row[2] is None, "codes": codes}
 
 
 def is_tracking_pushed(receipt_id):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tracking_pushed FROM synced_orders WHERE etsy_receipt_id = ?", (str(receipt_id),))
-    row = cursor.fetchone()
-    conn.close()
-    return bool(row and row[0] == 1)
-
-
-def record_synced_order(receipt_id, shopify_order_id, status="SUCCESS"):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO synced_orders (etsy_receipt_id, shopify_order_id, status)
-        VALUES (?, ?, ?)
-        ON CONFLICT(etsy_receipt_id) DO UPDATE SET
-            shopify_order_id = excluded.shopify_order_id,
-            status = excluded.status
-    """, (str(receipt_id), str(shopify_order_id), status))
-    conn.commit()
-    conn.close()
+    state = get_tracking_state(receipt_id)
+    return state["legacy_done"] or bool(state["codes"])
 
 
 def record_tracking_pushed(receipt_id, tracking_number, shopify_order_id=""):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO synced_orders (etsy_receipt_id, shopify_order_id, status, tracking_number, tracking_pushed)
-        VALUES (?, ?, 'SHIPPED', ?, 1)
+    """Marks one tracking code as pushed. Further codes for the same receipt are appended."""
+    _db_execute("""
+        INSERT INTO synced_orders
+            (etsy_receipt_id, shopify_order_id, status, tracking_number, tracking_pushed, tracking_pushed_at)
+        VALUES (?, ?, 'SHIPPED', ?, 1, CURRENT_TIMESTAMP)
         ON CONFLICT(etsy_receipt_id) DO UPDATE SET
-            tracking_number = excluded.tracking_number,
+            tracking_number = CASE
+                WHEN synced_orders.tracking_pushed = 1 AND COALESCE(synced_orders.tracking_number, '') <> ''
+                    THEN synced_orders.tracking_number || ',' || excluded.tracking_number
+                ELSE excluded.tracking_number
+            END,
             tracking_pushed = 1,
+            tracking_pushed_at = CURRENT_TIMESTAMP,
             status = 'SHIPPED'
     """, (str(receipt_id), str(shopify_order_id), str(tracking_number)))
-    conn.commit()
-    conn.close()
 
 
 # =====================================================================
-# AUTHENTICATION & HEADERS
+# AUTHENTICATION & HTTP HELPERS
 # =====================================================================
 
-def refresh_etsy_tokens():
-    global ETSY_ACCESS_TOKEN, ETSY_REFRESH_TOKEN
+def refresh_etsy_tokens(attempts=3):
+    global ETSY_ACCESS_TOKEN, ETSY_REFRESH_TOKEN, ETSY_TOKEN_EXPIRES_AT
     print("[Etsy] Refreshing access token...")
     url = "https://api.etsy.com/v3/public/oauth/token"
     payload = {
@@ -134,19 +225,37 @@ def refresh_etsy_tokens():
         "client_id": ETSY_KEYSTRING,
         "refresh_token": ETSY_REFRESH_TOKEN
     }
-    resp = requests.post(url, data=payload, timeout=15)
+    resp = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.post(url, data=payload, timeout=30)
+            break
+        except (requests.Timeout, requests.ConnectionError) as e:
+            print(f"[Etsy] Token refresh attempt {attempt}/{attempts} failed: {e}")
+            if attempt == attempts:
+                raise Exception(f"Failed to refresh Etsy token after {attempts} attempts: {e}")
+            time.sleep(3)
+
     if resp.status_code != 200:
         raise Exception(f"Failed to refresh Etsy token: {resp.text}")
 
     data = resp.json()
     ETSY_ACCESS_TOKEN = data["access_token"]
     ETSY_REFRESH_TOKEN = data["refresh_token"]
-    expires_at = str(int(time.time()) + data.get("expires_in", 3600))
+    ETSY_TOKEN_EXPIRES_AT = int(time.time()) + int(data.get("expires_in", 3600))
 
-    set_key(ENV_PATH, "ETSY_ACCESS_TOKEN", ETSY_ACCESS_TOKEN)
+    # Refresh token first: it is the one that cannot be recovered if the run dies here.
     set_key(ENV_PATH, "ETSY_REFRESH_TOKEN", ETSY_REFRESH_TOKEN)
-    set_key(ENV_PATH, "ETSY_TOKEN_EXPIRES_AT", expires_at)
+    set_key(ENV_PATH, "ETSY_ACCESS_TOKEN", ETSY_ACCESS_TOKEN)
+    set_key(ENV_PATH, "ETSY_TOKEN_EXPIRES_AT", str(ETSY_TOKEN_EXPIRES_AT))
     print("[Etsy] Token refreshed and saved to .env")
+
+
+def ensure_etsy_token():
+    """Refreshes the Etsy token only when it is missing or within 5 minutes of expiry."""
+    if ETSY_ACCESS_TOKEN and time.time() < ETSY_TOKEN_EXPIRES_AT - 300:
+        return
+    refresh_etsy_tokens()
 
 
 def get_etsy_headers():
@@ -154,6 +263,16 @@ def get_etsy_headers():
         "x-api-key": f"{ETSY_KEYSTRING}:{ETSY_SHARED_SECRET}",
         "Authorization": f"Bearer {ETSY_ACCESS_TOKEN}"
     }
+
+
+def etsy_request(method, url, **kwargs):
+    """Etsy API call that refreshes the token once and retries on a 401."""
+    kwargs.setdefault("timeout", 20)
+    resp = requests.request(method, url, headers=get_etsy_headers(), **kwargs)
+    if resp.status_code == 401:
+        refresh_etsy_tokens()
+        resp = requests.request(method, url, headers=get_etsy_headers(), **kwargs)
+    return resp
 
 
 def get_shopify_token():
@@ -188,32 +307,89 @@ def get_shopify_headers():
     }
 
 
+def shopify_request(method, url, **kwargs):
+    """Shopify API call that waits and retries when rate limited (429).
+
+    Timeouts are deliberately NOT retried: a timed-out order creation may have succeeded.
+    """
+    kwargs.setdefault("timeout", 20)
+    resp = None
+    for _ in range(4):
+        resp = requests.request(method, url, headers=get_shopify_headers(), **kwargs)
+        if resp.status_code != 429:
+            return resp
+        try:
+            wait = float(resp.headers.get("Retry-After", 2))
+        except ValueError:
+            wait = 2.0
+        time.sleep(min(wait, 10))
+    return resp
+
+
+def shopify_get_all(url, params, key, max_items):
+    """Follows Shopify's Link-header pagination. Raises on any non-200 page."""
+    items = []
+    next_url, next_params = url, params
+    while next_url and len(items) < max_items:
+        resp = shopify_request("GET", next_url, params=next_params)
+        if resp.status_code != 200:
+            raise Exception(f"Shopify GET {key} failed ({resp.status_code}): {resp.text}")
+        items.extend(resp.json().get(key, []))
+        next_url = resp.links.get("next", {}).get("url")
+        next_params = None  # the next URL already carries the query
+    return items[:max_items]
+
+
 # =====================================================================
 # SHOPIFY SKU LOOKUP & DUPLICATE GUARD
 # =====================================================================
 
+def shopify_graphql(query, variables=None):
+    """Runs a Shopify GraphQL query and returns its data. Raises on any error."""
+    url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    resp = shopify_request("POST", url, json={"query": query, "variables": variables or {}})
+    if resp.status_code != 200:
+        raise Exception(f"Shopify GraphQL failed ({resp.status_code}): {resp.text}")
+    body = resp.json()
+    if body.get("errors"):
+        raise Exception(f"Shopify GraphQL error: {body['errors']}")
+    return body.get("data") or {}
+
+
 def build_shopify_sku_map():
+    """Maps every Shopify variant SKU to its variant ID. Raises if Shopify cannot be read."""
+    query = """
+    query variants($cursor: String) {
+      productVariants(first: 250, after: $cursor) {
+        nodes { sku legacyResourceId }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+    """
     sku_map = {}
-    url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/products.json?limit=250&fields=id,title,variants"
-    try:
-        resp = requests.get(url, headers=get_shopify_headers(), timeout=15)
-        if resp.status_code == 200:
-            for prod in resp.json().get("products", []):
-                for v in prod.get("variants", []):
-                    sku = (v.get("sku") or "").strip()
-                    if sku:
-                        sku_map[sku] = v["id"]
-    except Exception as e:
-        print(f"[Shopify] Warning: Could not build SKU cache ({e}).")
+    cursor = None
+    for _ in range(200):  # up to 50,000 variants
+        page = shopify_graphql(query, {"cursor": cursor})["productVariants"]
+        for node in page["nodes"]:
+            sku = (node.get("sku") or "").strip()
+            if sku:
+                sku_map[sku] = int(node["legacyResourceId"])
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
     return sku_map
 
 
 def extract_etsy_receipt_id(order):
-    """Extracts 10-digit Etsy Receipt ID from Shopify order name, note, or tags."""
+    """Extracts the Etsy Receipt ID from a Shopify order's name, note, or tags."""
     name = str(order.get("name", "")).replace("#", "").strip()
-    if name.isdigit() and len(name) == 10:
+    if name.isdigit() and 10 <= len(name) <= 12:
         return name
     note = str(order.get("note") or "")
+    match = re.search(r"Receipt ID:\s*(\d{9,12})\b", note)
+    if match:
+        return match.group(1)
+    # Legacy fallback (orders imported by older tools): a bare 10-digit number.
     tags = str(order.get("tags") or "")
     match = re.search(r"\b(\d{10})\b", f"{note} {tags}")
     if match:
@@ -221,9 +397,9 @@ def extract_etsy_receipt_id(order):
     return None
 
 
-def build_existing_shopify_receipt_map():
-    """Fetches recent 250 Shopify orders and maps {etsy_receipt_id: shopify_order_id}."""
-    existing = {}
+def build_existing_shopify_receipt_map(max_orders=750):
+    """Maps {etsy_receipt_id: shopify_order_id} for recent Shopify orders. Raises on failure,
+    because an empty map would disable the duplicate-order guard."""
     url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
     params = {
         "status": "any",
@@ -231,57 +407,77 @@ def build_existing_shopify_receipt_map():
         "limit": 250,
         "fields": "id,name,note,tags"
     }
-    resp = requests.get(url, headers=get_shopify_headers(), params=params, timeout=20)
-    if resp.status_code == 200:
-        for order in resp.json().get("orders", []):
-            rid = extract_etsy_receipt_id(order)
-            if rid:
-                existing[rid] = order.get("id")
+    existing = {}
+    for order in shopify_get_all(url, params, "orders", max_items=max_orders):
+        rid = extract_etsy_receipt_id(order)
+        if rid:
+            existing.setdefault(rid, order.get("id"))
     return existing
+
+
+def add_shopify_order_tag(shopify_order_id, tag):
+    """Adds a tag to a Shopify order, keeping its existing tags. Returns True on success."""
+    url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders/{shopify_order_id}.json"
+    resp = shopify_request("GET", url, params={"fields": "id,tags"})
+    if resp.status_code != 200:
+        print(f"  [!] Could not read Shopify order {shopify_order_id} to tag it ({resp.status_code}).")
+        return False
+    tags = [t.strip() for t in (resp.json().get("order", {}).get("tags") or "").split(",") if t.strip()]
+    if tag in tags:
+        return True
+    tags.append(tag)
+    resp = shopify_request("PUT", url, json={"order": {"id": shopify_order_id, "tags": ", ".join(tags)}})
+    if resp.status_code != 200:
+        print(f"  [!] Could not tag Shopify order {shopify_order_id} ({resp.status_code}): {resp.text}")
+        return False
+    return True
 
 
 # =====================================================================
 # STEP 1: ETSY -> SHOPIFY ORDER IMPORT & DEADLINES
 # =====================================================================
 
-def fetch_etsy_orders(limit=40):
+def fetch_etsy_receipts(max_receipts=500):
+    """Fetches all paid, unshipped Etsy receipts (cancelled ones included), 100 per page."""
     url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts"
-    params = {
-        "was_paid": "true",
-        "was_shipped": "false",
-        "limit": limit
-    }
-    resp = requests.get(url, headers=get_etsy_headers(), params=params, timeout=15)
-    if resp.status_code == 401:
-        refresh_etsy_tokens()
-        resp = requests.get(url, headers=get_etsy_headers(), params=params, timeout=15)
+    receipts = []
+    offset = 0
+    while len(receipts) < max_receipts:
+        page_size = min(100, max_receipts - len(receipts))
+        params = {
+            "was_paid": "true",
+            "was_shipped": "false",
+            "limit": page_size,
+            "offset": offset
+        }
+        resp = etsy_request("GET", url, params=params)
+        if resp.status_code != 200:
+            raise Exception(f"Failed to fetch Etsy orders ({resp.status_code}): {resp.text}")
+        results = resp.json().get("results", [])
+        receipts.extend(results)
+        if len(results) < page_size:
+            break
+        offset += page_size
+        time.sleep(0.2)
+    else:
+        print(f"  [!] Reached the --limit of {max_receipts} receipts; there may be more on Etsy.")
+    return receipts
 
-    if resp.status_code != 200:
-        raise Exception(f"Failed to fetch Etsy orders ({resp.status_code}): {resp.text}")
 
-    raw_results = resp.json().get("results", [])
-    valid_orders = []
-
-    for receipt in raw_results:
-        rid = str(receipt.get("receipt_id"))
-        is_cancelled = receipt.get("is_cancelled", False)
-        status = str(receipt.get("status", "")).lower()
-
-        if is_cancelled or "cancel" in status or "refund" in status:
-            if not is_order_synced(rid):
-                print(f"  [-] Skipping newly detected cancelled Etsy Receipt #{rid} (Saved to DB)")
-                record_synced_order(rid, "CANCELLED_ON_ETSY", status="CANCELLED")
-            continue
-
-        valid_orders.append(receipt)
-
-    return valid_orders
+def is_receipt_cancelled(receipt):
+    """True for cancelled or fully refunded receipts. Partially refunded orders still ship."""
+    if receipt.get("is_cancelled"):
+        return True
+    status = str(receipt.get("status", "")).lower()
+    if "cancel" in status:
+        return True
+    return "refund" in status and "partial" not in status
 
 
 def parse_money(money_obj):
     if not money_obj or not isinstance(money_obj, dict):
         return 0.0
-    return money_obj.get("amount", 0) / money_obj.get("divisor", 100)
+    return money_obj.get("amount", 0) / (money_obj.get("divisor") or 100)
 
 
 def get_etsy_purchase_iso(receipt):
@@ -292,18 +488,150 @@ def get_etsy_purchase_iso(receipt):
     return None
 
 
-def get_etsy_ship_by_iso(receipt):
-    """Extracts Etsy's expected_ship_date from the receipt or its transactions and returns ISO 8601 UTC."""
+def get_etsy_expected_ship_ts(receipt):
+    """Etsy's expected_ship_date (unix seconds) from the receipt, or the latest of its transactions."""
     expected_ts = receipt.get("expected_ship_date")
     if not expected_ts:
-        txs = receipt.get("transactions", [])
-        ship_dates = [tx.get("expected_ship_date") for tx in txs if tx.get("expected_ship_date")]
+        ship_dates = [tx.get("expected_ship_date") for tx in receipt.get("transactions", [])
+                      if tx.get("expected_ship_date")]
         if ship_dates:
             expected_ts = max(ship_dates)
+    return int(expected_ts) if expected_ts else None
 
+
+def get_etsy_ship_by_iso(receipt):
+    """Etsy's expected ship date as ISO 8601 UTC, for Shopify's 'Fulfill by' deadline."""
+    expected_ts = get_etsy_expected_ship_ts(receipt)
     if expected_ts:
-        return datetime.fromtimestamp(int(expected_ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.fromtimestamp(expected_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return None
+
+
+def get_etsy_ship_by_date(receipt):
+    """Etsy's expected ship date as YYYY-MM-DD in this PC's local (UK) time."""
+    expected_ts = get_etsy_expected_ship_ts(receipt)
+    if expected_ts:
+        return datetime.fromtimestamp(expected_ts).strftime("%Y-%m-%d")
+    return None
+
+
+def get_etsy_shipping_choices(receipt):
+    """Every shipping option string Etsy attached to the receipt or its line items."""
+    choices = []
+    for src in [receipt] + list(receipt.get("transactions") or []):
+        for key in ("shipping_upgrade", "shipping_method"):
+            val = str(src.get(key) or "").strip()
+            if val and (key, val) not in choices:
+                choices.append((key, val))
+    return choices
+
+
+def detect_shipping(receipt):
+    """Works out the Shopify shipping line and tags from Etsy's shipping option.
+
+    Priority/express on ANY line item makes the whole order Tracked 24.
+    """
+    choices = get_etsy_shipping_choices(receipt)
+    values = [val for _, val in choices]
+    is_express = any(k in val.lower() for val in values for k in EXPRESS_KEYWORDS)
+    upgrade = next((val for key, val in choices if key == "shipping_upgrade"), "")
+    country = (receipt.get("country_iso") or HOME_COUNTRY).upper()
+    is_international = country != HOME_COUNTRY
+
+    tags = []
+    if is_international:
+        title = code = values[0] if values else "Royal Mail International Tracked"
+        tags.append("International")
+        if is_express:
+            tags.append("Priority")
+    elif is_express:
+        title = code = "Royal Mail Tracked 24"
+        tags.extend(["Tracked 24", "Priority"])
+    else:
+        title = code = "Royal Mail Tracked 48"
+        if upgrade:
+            tags.append(upgrade.replace(",", " ")[:40])
+
+    return {"title": title, "code": code, "tags": tags, "is_express": is_express}
+
+
+def _utc_str(ts):
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if ts else None
+
+
+def format_items(receipt):
+    """One readable line per item: '2x Title [SKU] (Option: value; Personalization: ...)'."""
+    lines = []
+    for tx in receipt.get("transactions") or []:
+        line = f"{tx.get('quantity', 1)}x {tx.get('title') or 'Etsy Item'}"
+        sku = (tx.get("sku") or "").strip()
+        if sku:
+            line += f" [{sku}]"
+        options = []
+        for var in tx.get("variations") or []:
+            name = var.get("formatted_name") or var.get("property_name") or "Option"
+            value = var.get("formatted_value") or var.get("value") or ""
+            if value:
+                options.append(f"{name}: {value}")
+        if tx.get("buyer_personalization"):
+            options.append(f"Personalization: {tx.get('buyer_personalization')}")
+        if options:
+            line += f" ({'; '.join(options)})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def extract_order_details(receipt):
+    """Flattens an Etsy receipt into the ORDER_DETAIL_COLUMNS values."""
+    receipt_id = str(receipt.get("receipt_id"))
+    transactions = receipt.get("transactions") or []
+    shipments = receipt.get("shipments") or []
+    upgrade = next((val for key, val in get_etsy_shipping_choices(receipt) if key == "shipping_upgrade"), None)
+    shipped_ts = [s.get("shipment_notification_timestamp") for s in shipments if s.get("shipment_notification_timestamp")]
+    if not shipped_ts:
+        shipped_ts = [tx.get("shipped_timestamp") for tx in transactions if tx.get("shipped_timestamp")]
+    codes = [str(s.get("tracking_code") or "").strip() for s in shipments]
+    email = (receipt.get("buyer_email") or "").strip() or get_cached_email(receipt_id)
+    return {
+        "order_date": _utc_str(receipt.get("create_timestamp") or receipt.get("created_timestamp")),
+        "etsy_status": receipt.get("status"),
+        "buyer_name": (receipt.get("name") or "").strip() or None,
+        "buyer_email": email or None,
+        "address_line1": receipt.get("first_line"),
+        "address_line2": receipt.get("second_line"),
+        "city": receipt.get("city"),
+        "county": receipt.get("state"),
+        "postcode": receipt.get("zip"),
+        "country": receipt.get("country_iso"),
+        "items": format_items(receipt),
+        "item_count": sum(int(tx.get("quantity") or 0) for tx in transactions),
+        "items_total": round(sum(parse_money(tx.get("price")) * (tx.get("quantity") or 0) for tx in transactions), 2),
+        "shipping_cost": round(parse_money(receipt.get("total_shipping_cost")), 2),
+        "discount": round(parse_money(receipt.get("discount_amt")), 2),
+        "tax": round(parse_money(receipt.get("total_tax_cost")) + parse_money(receipt.get("total_vat_cost")), 2),
+        "grand_total": round(parse_money(receipt.get("grandtotal")), 2),
+        "currency": (receipt.get("grandtotal") or {}).get("currency_code"),
+        "shipping_upgrade": upgrade,
+        "is_gift": 1 if receipt.get("is_gift") else 0,
+        "gift_message": receipt.get("gift_message") or None,
+        "buyer_note": receipt.get("message_from_buyer") or None,
+        "shipped_date": _utc_str(min(shipped_ts)) if shipped_ts else None,
+        "etsy_tracking": ",".join(c for c in codes if c) or None,
+    }
+
+
+def save_order_details(receipt):
+    """Writes the detail columns for a receipt that already has a row in synced_orders.
+
+    Only detail columns are touched: status, Shopify ID and tracking state are left alone.
+    A known email is never replaced by a blank one.
+    """
+    details = extract_order_details(receipt)
+    assignments = ", ".join(
+        f"{col} = COALESCE(?, {col})" if col == "buyer_email" else f"{col} = ?" for col in details)
+    _db_execute(
+        f"UPDATE synced_orders SET {assignments}, details_updated_at = CURRENT_TIMESTAMP WHERE etsy_receipt_id = ?",
+        tuple(details.values()) + (str(receipt.get("receipt_id")),))
 
 
 def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
@@ -311,9 +639,8 @@ def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
     if not shopify_order_id or not fulfill_by_iso:
         return
 
-    headers = get_shopify_headers()
     fo_url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders/{shopify_order_id}/fulfillment_orders.json"
-    resp = requests.get(fo_url, headers=headers, timeout=15)
+    resp = shopify_request("GET", fo_url)
     if resp.status_code != 200:
         print(f"  [!] Could not fetch fulfillment_orders for Shopify ID {shopify_order_id} ({resp.status_code}): {resp.text}")
         return
@@ -347,10 +674,10 @@ def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
         "fulfillmentOrderIds": open_fo_gids
     }
 
-    g_resp = requests.post(graphql_url, headers=headers, json={"query": query, "variables": variables}, timeout=15)
+    g_resp = shopify_request("POST", graphql_url, json={"query": query, "variables": variables})
     if g_resp.status_code == 200:
         data = g_resp.json()
-        result = data.get("data", {}).get("fulfillmentOrdersSetFulfillmentDeadline", {})
+        result = (data.get("data") or {}).get("fulfillmentOrdersSetFulfillmentDeadline") or {}
         user_errors = result.get("userErrors", [])
         if result.get("success") and not user_errors:
             print(f"  [+] Set 'Fulfill by' deadline to {fulfill_by_iso}")
@@ -405,43 +732,19 @@ def map_etsy_to_shopify(receipt, sku_map=None):
 
         line_items.append(item)
 
-    # 1. Shipping Upgrade Detection (Tracked 24 vs Tracked 48)
-    shipping_upgrade = receipt.get("shipping_upgrade")
-    if not shipping_upgrade:
-        for tx in transactions:
-            if tx.get("shipping_upgrade"):
-                shipping_upgrade = tx.get("shipping_upgrade")
-                break
-
-    shipping_str = str(shipping_upgrade or "")
-    is_express = any(k in shipping_str.lower() for k in ("24", "express", "first", "1st", "next day", "priority"))
-
-    if shipping_str:
-        shipping_title = shipping_str
-        shipping_code = "Royal Mail Tracked 24" if is_express else shipping_str
-    else:
-        shipping_title = "Royal Mail Tracked 48"
-        shipping_code = "Royal Mail Tracked 48"
+    # 1. Shipping (Tracked 24 vs Tracked 48 vs International)
+    shipping = detect_shipping(receipt)
 
     shipping_cost = parse_money(receipt.get("total_shipping_cost"))
-    discount_amt = parse_money(receipt.get("discount_amount"))
+    # Etsy's field is discount_amt; discount_amount is kept as a fallback.
+    discount_amt = parse_money(receipt.get("discount_amt") or receipt.get("discount_amount"))
     grandtotal = parse_money(receipt.get("grandtotal")) or max(0.0, items_subtotal + shipping_cost - discount_amt)
 
     # 2. Build Tags & Extract Dates
-    tags = ["Etsy"]
-    if is_express:
-        tags.extend(["Tracked 24", "Priority"])
-    elif shipping_str:
-        tags.append(shipping_str)
+    tags = ["Etsy"] + shipping["tags"]
 
-    expected_ts = receipt.get("expected_ship_date")
-    if not expected_ts:
-        ship_dates = [tx.get("expected_ship_date") for tx in transactions if tx.get("expected_ship_date")]
-        if ship_dates:
-            expected_ts = max(ship_dates)
-
-    if expected_ts:
-        ship_by_str = datetime.fromtimestamp(int(expected_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+    ship_by_str = get_etsy_ship_by_date(receipt)
+    if ship_by_str:
         tags.append(f"ShipBy:{ship_by_str}")
 
     processed_at_iso = get_etsy_purchase_iso(receipt)
@@ -474,7 +777,7 @@ def map_etsy_to_shopify(receipt, sku_map=None):
         "city": receipt.get("city") or "",
         "province": receipt.get("state") or "",
         "zip": receipt.get("zip") or "",
-        "country_code": receipt.get("country_iso") or "GB",
+        "country_code": receipt.get("country_iso") or HOME_COUNTRY,
     }
 
     customer_obj = {
@@ -504,12 +807,13 @@ def map_etsy_to_shopify(receipt, sku_map=None):
         "financial_status": "paid",
         "send_receipt": False,
         "send_fulfillment_receipt": False,
-        "inventory_behaviour": "decrement_obeying_policy",
+        # The Etsy order is already paid, so never let Shopify stock levels block the import.
+        "inventory_behaviour": "decrement_ignoring_policy",
         "shipping_lines": [
             {
-                "title": shipping_title,
+                "title": shipping["title"],
                 "price": f"{shipping_cost:.2f}",
-                "code": shipping_code
+                "code": shipping["code"]
             }
         ],
         "transactions": [transaction_entry],
@@ -537,10 +841,135 @@ def map_etsy_to_shopify(receipt, sku_map=None):
 
 def push_to_shopify(order_payload):
     url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
-    resp = requests.post(url, json=order_payload, headers=get_shopify_headers(), timeout=15)
+    resp = shopify_request("POST", url, json=order_payload, timeout=30)
     if resp.status_code not in (200, 201):
         raise Exception(f"Shopify order creation failed ({resp.status_code}): {resp.text}")
     return resp.json().get("order", {})
+
+
+def _numeric_id(value):
+    """Returns a stored Shopify order ID if it is a real one (not a placeholder like CANCELLED_ON_ETSY)."""
+    value = str(value or "")
+    return value if value.isdigit() else None
+
+
+def handle_cancelled_receipt(receipt, existing_shopify_map, dry_run):
+    """Records a cancelled Etsy receipt. Returns True if it had ALREADY been imported into
+    Shopify, in which case the Shopify order is tagged so it is not packed by mistake."""
+    receipt_id = str(receipt.get("receipt_id"))
+    row = get_synced_row(receipt_id)
+    status = row["status"] if row else None
+    if status in ("CANCELLED", "CANCELLED_AFTER_IMPORT", "SHIPPED"):
+        return False
+
+    shopify_id = existing_shopify_map.get(receipt_id) or (_numeric_id(row["shopify_order_id"]) if row else None)
+    if shopify_id:
+        print(f"  [!!!] Etsy Receipt #{receipt_id} was CANCELLED/REFUNDED on Etsy after it was imported "
+              f"(Shopify ID: {shopify_id}). DO NOT SHIP - cancel it in Shopify.")
+        if not dry_run and add_shopify_order_tag(shopify_id, CANCELLED_TAG):
+            record_synced_order(receipt_id, shopify_id, status="CANCELLED_AFTER_IMPORT")
+            print(f"        Tagged the Shopify order '{CANCELLED_TAG}'.")
+        return True
+
+    print(f"  [-] Skipping newly detected cancelled Etsy Receipt #{receipt_id}")
+    if not dry_run:
+        record_synced_order(receipt_id, "CANCELLED_ON_ETSY", status="CANCELLED")
+    return False
+
+
+def import_etsy_orders(args):
+    print(f"\n--- Checking Unshipped Orders: Etsy -> Shopify (Dry Run: {args.dry_run}) ---")
+    # Both lookups raise on failure: importing without them risks duplicates or unlinked items.
+    sku_map = build_shopify_sku_map() if args.import_orders else {}
+    existing_shopify_map = build_existing_shopify_receipt_map()
+    receipts = fetch_etsy_receipts(max_receipts=args.limit)
+    orders = [r for r in receipts if not is_receipt_cancelled(r)]
+    cancelled = [r for r in receipts if is_receipt_cancelled(r)]
+    print(f"Found {len(orders)} active unshipped/paid receipt(s) on Etsy.")
+
+    created_count, backfilled_count, skipped_existing, failed_import = 0, 0, 0, 0
+    cancelled_after_import = sum(
+        1 for r in cancelled if handle_cancelled_receipt(r, existing_shopify_map, args.dry_run))
+
+    for receipt in orders:
+        receipt_id = str(receipt["receipt_id"])
+        fulfill_by_iso = get_etsy_ship_by_iso(receipt)
+        ship_by_date = get_etsy_ship_by_date(receipt)
+        processed_at_iso = get_etsy_purchase_iso(receipt)
+        row = get_synced_row(receipt_id)
+        # A CANCELLED row for a receipt that is NOT cancelled was a wrongly skipped order
+        # (e.g. partially refunded), so it is treated as never imported.
+        in_db = row is not None and row["status"] != "CANCELLED"
+
+        # Check if order already exists in Shopify
+        if receipt_id in existing_shopify_map or in_db:
+            existing_id = existing_shopify_map.get(receipt_id) or (_numeric_id(row["shopify_order_id"]) if row else None)
+            if not args.dry_run:
+                if existing_id and not in_db:
+                    record_synced_order(receipt_id, existing_id, status="EXISTING_IN_SHOPIFY",
+                                        expected_ship_date=ship_by_date)
+                elif in_db and ship_by_date and row["expected_ship_date"] != ship_by_date:
+                    set_expected_ship_date(receipt_id, ship_by_date)
+                if in_db or existing_id:
+                    save_order_details(receipt)
+            if args.backfill_deadlines and existing_id and fulfill_by_iso:
+                print(f"  [~] Backfilling 'Fulfill by' ({fulfill_by_iso}) for existing Order #{receipt_id} (Shopify ID: {existing_id})...")
+                if not args.dry_run:
+                    set_shopify_fulfill_by(existing_id, fulfill_by_iso)
+                backfilled_count += 1
+            else:
+                print(f"  [-] Skipping Receipt #{receipt_id}: already in Shopify/DB.")
+                skipped_existing += 1
+            continue
+
+        if not args.import_orders:
+            continue
+
+        print(f"\nProcessing Etsy Receipt #{receipt_id} for {receipt.get('name')}...")
+        if row is not None:
+            print(f"  [i] Previously skipped as cancelled, but its Etsy status is '{receipt.get('status')}' - importing.")
+        payload = map_etsy_to_shopify(receipt, sku_map=sku_map)
+        o_data = payload["order"]
+        unlinked = [i.get("sku", "no SKU") for i in o_data["line_items"] if "variant_id" not in i]
+
+        if args.dry_run:
+            c_name = f"{o_data['customer']['first_name']} {o_data['customer']['last_name']}"
+            print(f"  [DRY RUN] Order Name: #{o_data['name']} | Customer: {c_name} | Total: £{o_data['transactions'][0]['amount']}")
+            print(f"  [DRY RUN] Purchase Time (processed_at): {processed_at_iso} | Fulfill By: {fulfill_by_iso}")
+            print(f"  [DRY RUN] Tags: {o_data['tags']}")
+            print(f"  [DRY RUN] Shipping: {o_data['shipping_lines'][0]['title']} (£{o_data['shipping_lines'][0]['price']})")
+            print(f"  [DRY RUN] Etsy shipping fields: {get_etsy_shipping_choices(receipt) or 'none sent'}")
+            if o_data.get("discount_codes"):
+                print(f"  [DRY RUN] Discount: £{o_data['discount_codes'][0]['amount']}")
+            for item in o_data["line_items"]:
+                var_info = f" [Variant ID: {item['variant_id']}]" if "variant_id" in item else " [Unlinked SKU]"
+                props = f" | Options: {item.get('properties')}" if item.get("properties") else ""
+                print(f"    - {item['quantity']}x {item['title']} (SKU: {item.get('sku', 'N/A')}){var_info}{props}")
+            continue
+
+        try:
+            created_order = push_to_shopify(payload)
+        except Exception as e:
+            print(f"  [!] Failed to push order #{receipt_id}: {e}")
+            failed_import += 1
+            continue
+
+        shopify_id = created_order.get("id")
+        record_synced_order(receipt_id, shopify_id, status="SUCCESS", expected_ship_date=ship_by_date)
+        save_order_details(receipt)
+        created_count += 1
+        print(f"  [+] Created Shopify Order {created_order.get('name')} (ID: {shopify_id}, Purchased: {processed_at_iso})")
+        if unlinked:
+            print(f"  [!] {len(unlinked)} line item(s) not linked to a Shopify product: {', '.join(unlinked)}")
+        if fulfill_by_iso:
+            try:
+                set_shopify_fulfill_by(shopify_id, fulfill_by_iso)
+            except Exception as e:
+                print(f"  [!] Order created, but setting 'Fulfill by' failed ({e}). Run --backfill-deadlines later.")
+
+    print(f"\nOrder Import Summary -> Created: {created_count} | Backfilled: {backfilled_count} | "
+          f"Skipped (Existing): {skipped_existing} | Failed: {failed_import} | "
+          f"Cancelled after import: {cancelled_after_import}")
 
 
 # =====================================================================
@@ -568,27 +997,94 @@ def map_carrier_for_etsy(shopify_company):
     return "royal-mail"
 
 
-def sync_tracking_to_etsy(dry_run=False, limit=200):
+def collect_parcels(order):
+    """Every distinct (tracking_code, carrier) across an order's non-cancelled fulfillments."""
+    parcels = []
+    for f in order.get("fulfillments") or []:
+        if f.get("status") == "cancelled":
+            continue
+        numbers = f.get("tracking_numbers") or ([f.get("tracking_number")] if f.get("tracking_number") else [])
+        for number in numbers:
+            code = str(number or "").strip()
+            if code and code not in [p[0] for p in parcels]:
+                parcels.append((code, f.get("tracking_company")))
+    return parcels
+
+
+def get_dispatch_due_date(receipt_id, order):
+    """The Etsy ship-by date for an order: from orders.db, else the order's ShipBy: tag."""
+    row = get_synced_row(receipt_id)
+    candidate = row["expected_ship_date"] if row else None
+    if not candidate:
+        match = re.search(r"ShipBy:(\d{4}-\d{2}-\d{2})", str(order.get("tags") or ""))
+        candidate = match.group(1) if match else None
+    try:
+        return date.fromisoformat(candidate) if candidate else None
+    except ValueError:
+        return None
+
+
+def get_etsy_shipment_state(receipt_id):
+    """Asks Etsy what it already knows about a receipt before we push tracking.
+
+    Returns {is_shipped, codes, cancelled}, or None if the receipt could not be read.
+    This is what stops an order being dispatched (and the buyer emailed) twice when
+    orders.db has no record of it, e.g. orders shipped before this tool existed.
+    """
+    url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts/{receipt_id}"
+    try:
+        resp = etsy_request("GET", url)
+    except requests.RequestException as e:
+        print(f"  [!] Could not check Etsy #{receipt_id}: {e}")
+        return None
+    if resp.status_code != 200:
+        print(f"  [!] Could not check Etsy #{receipt_id}: {resp.status_code} -> {resp.text}")
+        return None
+    data = resp.json()
+    codes = {str(s.get("tracking_code") or "").strip() for s in data.get("shipments") or []}
+    return {
+        "is_shipped": bool(data.get("is_shipped")),
+        "codes": codes - {""},
+        "cancelled": is_receipt_cancelled(data),
+    }
+
+
+def load_dispatch_note():
+    """The optional message sent to the buyer with the dispatch notification.
+    Plain text from dispatch_note.txt; no file (or an empty one) means no note."""
+    try:
+        with open(DISPATCH_NOTE_PATH, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def is_already_shipped_response(resp):
+    text = resp.text.lower()
+    return (
+        resp.status_code == 409
+        or "already shipped" in text
+        or (resp.status_code == 400 and "already in use" in text)
+    )
+
+
+def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False):
     print(f"\n--- Checking Shopify Fulfillments to Dispatch on Etsy (Dry Run: {dry_run}) ---")
     url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
     params = {
         "status": "any",
         "order": "created_at desc",
-        "limit": limit,
+        "limit": 250,
         "fields": "id,name,note,tags,fulfillment_status,fulfillments"
     }
+    orders = shopify_get_all(url, params, "orders", max_items=limit)
+    ensure_etsy_token()
+    dispatch_note = load_dispatch_note()
+    print(f"Buyer dispatch note: {'ON (dispatch_note.txt)' if dispatch_note else 'off (no dispatch_note.txt)'}")
 
-    resp = requests.get(url, headers=get_shopify_headers(), params=params, timeout=20)
-    if resp.status_code != 200:
-        raise Exception(f"Failed to fetch orders from Shopify: {resp.text}")
-
-    orders = resp.json().get("orders", [])
-
-    refresh_etsy_tokens()
-    etsy_headers = get_etsy_headers()
-    etsy_headers.pop("Content-Type", None)
-
+    today = date.today()
     dispatched, skipped_db, skipped_etsy, failed = 0, 0, 0, 0
+    held = []
 
     for o in orders:
         shopify_id = o.get("id")
@@ -596,134 +1092,211 @@ def sync_tracking_to_etsy(dry_run=False, limit=200):
         if not receipt_id:
             continue
 
-        fulfillments = o.get("fulfillments", [])
-        valid_fulfillments = [
-            f for f in fulfillments
-            if f.get("tracking_number") and f.get("status") != "cancelled"
-        ]
-        if not valid_fulfillments:
+        parcels = collect_parcels(o)
+        if not parcels:
             continue
 
-        if is_tracking_pushed(receipt_id):
+        state = get_tracking_state(receipt_id)
+        to_push = [] if state["legacy_done"] else [p for p in parcels if p[0] not in state["codes"]]
+        if not to_push:
             skipped_db += 1
             continue
 
-        tracking_code = str(valid_fulfillments[0].get("tracking_number")).strip()
-        carrier_slug = map_carrier_for_etsy(valid_fulfillments[0].get("tracking_company"))
-
-        if dry_run:
-            print(f"  [DRY RUN] Would dispatch Etsy #{receipt_id} -> {tracking_code} ({carrier_slug})")
+        due = get_dispatch_due_date(receipt_id, o)
+        if due and today < due and not force_dispatch:
+            held.append((due, receipt_id))
             continue
 
-        payload = {
-            "tracking_code": tracking_code,
-            "carrier_name": carrier_slug,
-            "send_bcc": "false"
-        }
+        etsy_state = get_etsy_shipment_state(receipt_id)
+        time.sleep(0.15)
+        if etsy_state is None:
+            failed += 1
+            continue
+        if etsy_state["cancelled"] and not etsy_state["is_shipped"]:
+            print(f"  [!!!] Etsy #{receipt_id} is CANCELLED/REFUNDED on Etsy but has a label in Shopify. "
+                  f"Not dispatched{'' if dry_run else ' (will not be checked again)'}.")
+            if not dry_run:
+                record_synced_order(receipt_id, shopify_id, status="CANCELLED_AFTER_IMPORT")
+                _db_execute("UPDATE synced_orders SET tracking_pushed = 1 WHERE etsy_receipt_id = ?", (receipt_id,))
+            failed += 1
+            continue
+        # Shipped on Etsy with nothing in our DB: it was dispatched outside this tool. Never re-notify.
+        shipped_elsewhere = etsy_state["is_shipped"] and not state["codes"]
 
         etsy_url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts/{receipt_id}/tracking"
-        r = requests.post(etsy_url, headers=etsy_headers, data=payload, timeout=15)
+        for index, (tracking_code, company) in enumerate(to_push):
+            carrier_slug = map_carrier_for_etsy(company)
+            is_extra_parcel = bool(state["codes"]) or index > 0
+            label = " (additional parcel)" if is_extra_parcel else ""
 
-        if r.status_code == 200:
-            print(f"  [+] Dispatched Etsy #{receipt_id} with {tracking_code} ({carrier_slug})")
-            record_tracking_pushed(receipt_id, tracking_code, shopify_id)
-            dispatched += 1
-        elif (
-            r.status_code == 409
-            or "already shipped" in r.text.lower()
-            or (r.status_code == 400 and "already in use" in r.text.lower())
-        ):
-            print(f"  [-] Etsy #{receipt_id} already had tracking recorded on Etsy (Saved to DB)")
-            record_tracking_pushed(receipt_id, tracking_code, shopify_id)
-            skipped_etsy += 1
-        else:
-            print(f"  [!] Failed #{receipt_id}: {r.status_code} -> {r.text}")
-            failed += 1
+            if shipped_elsewhere or tracking_code in etsy_state["codes"]:
+                if index == 0:
+                    print(f"  [-] Etsy #{receipt_id} is already dispatched on Etsy"
+                          f"{'' if dry_run else ' (Saved to DB)'}")
+                    skipped_etsy += 1
+                if not dry_run:
+                    record_tracking_pushed(receipt_id, tracking_code, shopify_id)
+                continue
 
-        time.sleep(0.3)
+            if dry_run:
+                print(f"  [DRY RUN] Would dispatch Etsy #{receipt_id} -> {tracking_code} ({carrier_slug}){label}")
+                continue
 
-    print(f"Tracking Sync Summary -> Dispatched: {dispatched} | Skipped (DB): {skipped_db} | Skipped (Etsy): {skipped_etsy} | Failed: {failed}")
+            payload = {
+                "tracking_code": tracking_code,
+                "carrier_name": carrier_slug,
+                "send_bcc": "false"
+            }
+            if dispatch_note and not is_extra_parcel:
+                payload["note_to_buyer"] = dispatch_note
+            try:
+                r = etsy_request("POST", etsy_url, data=payload)
+            except requests.RequestException as e:
+                print(f"  [!] Failed #{receipt_id}: {e}")
+                failed += 1
+                continue
+
+            if r.status_code in (200, 201):
+                print(f"  [+] Dispatched Etsy #{receipt_id} with {tracking_code} ({carrier_slug}){label}")
+                record_tracking_pushed(receipt_id, tracking_code, shopify_id)
+                dispatched += 1
+            elif is_already_shipped_response(r):
+                print(f"  [-] Etsy #{receipt_id} already had tracking recorded on Etsy (Saved to DB)")
+                record_tracking_pushed(receipt_id, tracking_code, shopify_id)
+                skipped_etsy += 1
+            elif is_extra_parcel and 400 <= r.status_code < 500:
+                # Etsy refused a second tracking code; record it so it is not retried every run.
+                print(f"  [!] Etsy rejected additional parcel {tracking_code} for #{receipt_id} "
+                      f"({r.status_code} -> {r.text}). Not retrying.")
+                record_tracking_pushed(receipt_id, tracking_code, shopify_id)
+                failed += 1
+            else:
+                print(f"  [!] Failed #{receipt_id}: {r.status_code} -> {r.text}")
+                failed += 1
+
+            time.sleep(0.3)
+
+    if held:
+        print(f"\n  Holding {len(held)} order(s) until their Etsy ship-by date "
+              f"(run again on the day, or use --force-dispatch):")
+        for due, receipt_id in sorted(held):
+            print(f"    - Etsy #{receipt_id}: dispatch on {due.strftime('%a %d %b %Y')}")
+
+    print(f"Tracking Sync Summary -> Dispatched: {dispatched} | Held until ship-by date: {len(held)} | "
+          f"Skipped (DB): {skipped_db} | Skipped (Etsy): {skipped_etsy} | Failed: {failed}")
+
+
+# =====================================================================
+# HOUSEKEEPING: RUN LOG, DUE LIST, BACKUP
+# =====================================================================
+
+class _Tee:
+    """Sends everything printed to both the console and the run log."""
+
+    def __init__(self, console, logfile):
+        self.console, self.logfile = console, logfile
+
+    def write(self, data):
+        try:
+            self.console.write(data)
+        except UnicodeEncodeError:
+            enc = getattr(self.console, "encoding", None) or "ascii"
+            self.console.write(data.encode(enc, "replace").decode(enc))
+        self.logfile.write(data)
+
+    def flush(self):
+        self.console.flush()
+        self.logfile.flush()
+
+
+def start_run_log(argv):
+    """Appends this run's output to logs/YYYY-MM-DD.log and deletes logs older than LOG_KEEP_DAYS."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    cutoff = time.time() - LOG_KEEP_DAYS * 86400
+    for name in os.listdir(LOG_DIR):
+        path = os.path.join(LOG_DIR, name)
+        if name.endswith(".log") and os.path.getmtime(path) < cutoff:
+            os.remove(path)
+    logfile = open(os.path.join(LOG_DIR, f"{date.today().isoformat()}.log"), "a", encoding="utf-8")
+    logfile.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} | sync.py {' '.join(argv) or '(tracking only)'} =====\n")
+    sys.stdout = _Tee(sys.stdout, logfile)
+    return logfile
+
+
+def print_due_orders():
+    """Lists imported orders that are due today or overdue and still not dispatched on Etsy."""
+    today = date.today().isoformat()
+    rows = _db_query("""
+        SELECT etsy_receipt_id, expected_ship_date, buyer_name FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+          AND expected_ship_date IS NOT NULL AND expected_ship_date <= ? AND expected_ship_date >= date(?, '-21 days')
+        ORDER BY expected_ship_date
+    """, (today, today))
+    if not rows:
+        return
+    print(f"\n--- {len(rows)} order(s) due today or overdue, not yet dispatched on Etsy ---")
+    for receipt_id, ship_by, name in rows:
+        when = "DUE TODAY" if ship_by == today else f"OVERDUE since {ship_by}"
+        print(f"  [{when}] Etsy #{receipt_id}{' - ' + name if name else ''}")
+
+
+def backup_database():
+    """Copies orders.db into BACKUP_DIR as orders-YYYY-MM-DD.db and keeps the newest BACKUP_KEEP.
+    Never raises: a failed backup must not look like a failed sync."""
+    try:
+        if BACKUP_DIR == DEFAULT_BACKUP_DIR:
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+        if not os.path.isdir(BACKUP_DIR):
+            print(f"[Backup] Folder not found: {BACKUP_DIR} (check BACKUP_DIR in .env)")
+            return
+        dest = os.path.join(BACKUP_DIR, f"orders-{date.today().isoformat()}.db")
+        tmp = dest + ".tmp"
+        with closing(sqlite3.connect(DB_PATH)) as src, closing(sqlite3.connect(tmp)) as dst:
+            src.backup(dst)
+        os.replace(tmp, dest)
+        backups = sorted(n for n in os.listdir(BACKUP_DIR) if re.fullmatch(r"orders-\d{4}-\d{2}-\d{2}\.db", n))
+        for old in backups[:-BACKUP_KEEP]:
+            os.remove(os.path.join(BACKUP_DIR, old))
+        print(f"[Backup] Saved {dest}")
+    except Exception as e:
+        print(f"[Backup] FAILED: {e}")
 
 
 # =====================================================================
 # MAIN CLI ENTRYPOINT
 # =====================================================================
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Etsy <-> Shopify Order & Tracking Sync.")
-    parser.add_argument("--dry-run", action="store_true", help="Preview actions without creating orders or pushing tracking.")
-    parser.add_argument("--limit", type=int, default=100, help="Max Etsy orders to check per run (default: 100).")
+    parser.add_argument("--dry-run", action="store_true", help="Preview actions without creating orders, pushing tracking, or writing to orders.db.")
+    parser.add_argument("--limit", type=int, default=500, help="Max Etsy receipts to check per run (default: 500).")
     parser.add_argument("--import-orders", action="store_true", help="Import unshipped Etsy orders into Shopify.")
     parser.add_argument("--backfill-deadlines", action="store_true", help="Update 'Fulfill by' deadlines on already-imported unshipped orders.")
     parser.add_argument("--tracking-only", action="store_true", help="Only push fulfilled tracking numbers from Shopify to Etsy (default behavior).")
-    args = parser.parse_args()
+    parser.add_argument("--force-dispatch", action="store_true", help="Mark orders dispatched on Etsy now, even before their ship-by date.")
+    args = parser.parse_args(argv)
 
-    init_db()
-    refresh_etsy_tokens()
+    console = sys.stdout
+    logfile = start_run_log(sys.argv[1:] if argv is None else argv)
+    try:
+        init_db()
+        ensure_etsy_token()
 
-    if args.import_orders or args.backfill_deadlines:
-        print(f"\n--- Checking Unshipped Orders: Etsy -> Shopify (Dry Run: {args.dry_run}) ---")
-        sku_map = build_shopify_sku_map() if args.import_orders else {}
-        existing_shopify_map = build_existing_shopify_receipt_map()
-        orders = fetch_etsy_orders(limit=args.limit)
-        print(f"Found {len(orders)} active unshipped/paid receipt(s) on Etsy.")
+        if (args.import_orders or args.backfill_deadlines) and not args.tracking_only:
+            import_etsy_orders(args)
 
-        created_count, backfilled_count, skipped_existing, failed_import = 0, 0, 0, 0
-
-        for receipt in orders:
-            receipt_id = str(receipt["receipt_id"])
-            fulfill_by_iso = get_etsy_ship_by_iso(receipt)
-            processed_at_iso = get_etsy_purchase_iso(receipt)
-
-            # Check if order already exists in Shopify
-            if receipt_id in existing_shopify_map or is_order_synced(receipt_id):
-                existing_id = existing_shopify_map.get(receipt_id)
-                if args.backfill_deadlines and existing_id and fulfill_by_iso:
-                    print(f"  [~] Backfilling 'Fulfill by' ({fulfill_by_iso}) for existing Order #{receipt_id} (Shopify ID: {existing_id})...")
-                    if not args.dry_run:
-                        set_shopify_fulfill_by(existing_id, fulfill_by_iso)
-                    backfilled_count += 1
-                else:
-                    print(f"  [-] Skipping Receipt #{receipt_id}: already in Shopify/DB.")
-                    if existing_id and not is_order_synced(receipt_id) and not args.dry_run:
-                        record_synced_order(receipt_id, existing_id, status="EXISTING_IN_SHOPIFY")
-                    skipped_existing += 1
-                continue
-
-            if not args.import_orders:
-                continue
-
-            print(f"\nProcessing Etsy Receipt #{receipt_id} for {receipt.get('name')}...")
-            payload = map_etsy_to_shopify(receipt, sku_map=sku_map)
-
-            if args.dry_run:
-                o_data = payload["order"]
-                c_name = f"{o_data['customer']['first_name']} {o_data['customer']['last_name']}"
-                print(f"  [DRY RUN] Order Name: #{o_data['name']} | Customer: {c_name} | Total: £{o_data['transactions'][0]['amount']}")
-                print(f"  [DRY RUN] Purchase Time (processed_at): {processed_at_iso} | Fulfill By: {fulfill_by_iso}")
-                print(f"  [DRY RUN] Tags: {o_data['tags']}")
-                print(f"  [DRY RUN] Shipping: {o_data['shipping_lines'][0]['title']} (£{o_data['shipping_lines'][0]['price']})")
-                for item in o_data["line_items"]:
-                    var_info = f" [Variant ID: {item['variant_id']}]" if "variant_id" in item else " [Unlinked SKU]"
-                    props = f" | Options: {item.get('properties')}" if item.get("properties") else ""
-                    print(f"    - {item['quantity']}x {item['title']} (SKU: {item.get('sku', 'N/A')}){var_info}{props}")
-            else:
-                try:
-                    created_order = push_to_shopify(payload)
-                    shopify_id = created_order.get("id")
-                    record_synced_order(receipt_id, shopify_id, status="SUCCESS")
-                    print(f"  [+] Created Shopify Order {created_order.get('name')} (ID: {shopify_id}, Purchased: {processed_at_iso})")
-                    if fulfill_by_iso:
-                        set_shopify_fulfill_by(shopify_id, fulfill_by_iso)
-                    created_count += 1
-                except Exception as e:
-                    print(f"  [!] Failed to push order #{receipt_id}: {e}")
-                    failed_import += 1
-
-        print(f"\nOrder Import Summary -> Created: {created_count} | Backfilled: {backfilled_count} | Skipped (Existing): {skipped_existing} | Failed: {failed_import}")
-
-    sync_tracking_to_etsy(dry_run=args.dry_run, limit=200)
-    print("\n--- Sync Complete ---")
+        sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch)
+        print_due_orders()
+        if not args.dry_run:
+            backup_database()
+        print("\n--- Sync Complete ---")
+    except Exception:
+        print("\n[!!!] The sync stopped with an error:")
+        traceback.print_exc(file=sys.stdout)
+        sys.exit(1)
+    finally:
+        sys.stdout = console
+        logfile.close()
 
 
 if __name__ == "__main__":
