@@ -1217,35 +1217,72 @@ def fulfill_shopify_order(shopify_order_id, tracking_code, carrier):
     return "fulfilled"
 
 
+def fetch_recent_shipped_receipts(pages=1):
+    """The shop's most recent dispatched receipts (newest first), as {receipt_id: receipt}.
+
+    One request per 100 receipts, instead of one request per waiting order.
+    Also returns the purchase time (UTC string) of the oldest receipt fetched.
+    """
+    url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts"
+    found, oldest = {}, None
+    for page in range(pages):
+        resp = etsy_request("GET", url, params={"was_paid": "true", "was_shipped": "true",
+                                                "limit": 100, "offset": page * 100})
+        if resp.status_code != 200:
+            raise Exception(f"Failed to fetch dispatched Etsy receipts ({resp.status_code}): {resp.text}")
+        results = resp.json().get("results", [])
+        for receipt in results:
+            found[str(receipt.get("receipt_id"))] = receipt
+            ts = receipt.get("create_timestamp") or receipt.get("created_timestamp")
+            if ts:
+                stamp = _utc_str(ts)
+                oldest = stamp if oldest is None else min(oldest, stamp)
+        if len(results) < 100:
+            break
+        time.sleep(0.2)
+    return found, oldest
+
+
 def sync_etsy_dispatch_to_shopify(dry_run=False):
     """For orders whose label was bought on Etsy: marks the Shopify copy as fulfilled.
 
-    Looks at orders that are in Shopify but have no dispatch recorded here, asks Etsy
-    whether each is already dispatched, and if so fulfils it in Shopify with Etsy's
-    tracking number. The order is then recorded as SHIPPED so the tracking sync never
-    sends that tracking back to Etsy.
+    Looks at orders that are in Shopify but have no dispatch recorded here, and checks them
+    against Etsy's 100 most recent dispatches (one request in total). Any waiting order older than
+    that window is checked individually, so nothing is missed. A dispatched order is
+    fulfilled in Shopify with Etsy's tracking number, then recorded as SHIPPED so the
+    tracking sync never sends that tracking back to Etsy.
     """
     print(f"\n--- Checking Etsy Dispatches to Mark Fulfilled in Shopify (Dry Run: {dry_run}) ---")
     rows = _db_query("""
-        SELECT etsy_receipt_id, shopify_order_id FROM synced_orders
+        SELECT etsy_receipt_id, shopify_order_id, order_date FROM synced_orders
         WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
         ORDER BY synced_at DESC LIMIT 300
     """)
     fulfilled, already, failed = 0, 0, 0
+    if not rows:
+        print("Etsy Dispatch Summary -> Nothing waiting.")
+        return
 
-    for receipt_id, shopify_id in rows:
+    recent, oldest = fetch_recent_shipped_receipts()
+
+    for receipt_id, shopify_id, order_date in rows:
         shopify_id = _numeric_id(shopify_id)
         if not shopify_id:
             continue
-        url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts/{receipt_id}"
         try:
-            resp = etsy_request("GET", url)
-            time.sleep(0.15)
-            if resp.status_code != 200:
-                print(f"  [!] Could not check Etsy #{receipt_id}: {resp.status_code} -> {resp.text}")
-                failed += 1
-                continue
-            receipt = resp.json()
+            receipt = recent.get(str(receipt_id))
+            if receipt is None:
+                # Not in the recent dispatches. Newer than the window means it is not dispatched;
+                # older (or undated) means it could have been missed, so ask Etsy directly.
+                if order_date and oldest and order_date >= oldest:
+                    continue
+                resp = etsy_request("GET", f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts/{receipt_id}")
+                time.sleep(0.15)
+                if resp.status_code != 200:
+                    print(f"  [!] Could not check Etsy #{receipt_id}: {resp.status_code} -> {resp.text}")
+                    failed += 1
+                    continue
+                receipt = resp.json()
             if not receipt.get("is_shipped"):
                 continue
 
