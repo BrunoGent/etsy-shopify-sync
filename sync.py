@@ -877,8 +877,125 @@ def handle_cancelled_receipt(receipt, existing_shopify_map, dry_run):
     return False
 
 
+def is_northern_ireland(receipt):
+    """True for a UK delivery address in Northern Ireland: every NI postcode starts with BT
+    followed by a digit. The Republic of Ireland (country IE) is not matched."""
+    country = (receipt.get("country_iso") or HOME_COUNTRY).strip().upper()
+    if country != HOME_COUNTRY:
+        return False
+    postcode = re.sub(r"\s+", "", str(receipt.get("zip") or "")).upper()
+    if re.match(r"BT\d", postcode):
+        return True
+    return "northern ireland" in str(receipt.get("state") or "").lower()
+
+
+NI_TAG = "NI - dispatch on Etsy"
+NI_HOLD_NOTE = ("Northern Ireland: buy the label and dispatch on Etsy. "
+                "This hold is released automatically once Etsy shows it dispatched.")
+
+# Northern Ireland orders still waiting to be dispatched on Etsy, collected during this run
+# (imported on hold now, or imported on hold earlier); shown in a banner at the end.
+ni_held_orders = []
+
+
+def hold_shopify_order(shopify_order_id, note=NI_HOLD_NOTE):
+    """Puts every open fulfillment order of a Shopify order on hold, so it shows as 'On hold'
+    instead of 'Unfulfilled' and no label can be bought for it. Returns True if it is held."""
+    fo_url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders/{shopify_order_id}/fulfillment_orders.json"
+    open_ids, fos = [], []
+    for attempt in range(2):          # Shopify can take a moment to create the fulfillment order
+        resp = shopify_request("GET", fo_url)
+        if resp.status_code != 200:
+            print(f"  [!] Could not read fulfillment orders for Shopify ID {shopify_order_id} ({resp.status_code}): {resp.text}")
+            return False
+        fos = resp.json().get("fulfillment_orders", [])
+        open_ids = [fo["id"] for fo in fos if fo.get("status") in ("open", "in_progress")]
+        if open_ids or any(fo.get("status") == "on_hold" for fo in fos):
+            break
+        time.sleep(2)
+    if not open_ids:
+        return any(fo.get("status") == "on_hold" for fo in fos)
+
+    mutation = """
+    mutation hold($id: ID!, $hold: FulfillmentOrderHoldInput!) {
+      fulfillmentOrderHold(id: $id, fulfillmentHold: $hold) {
+        fulfillmentHold { id }
+        userErrors { field message }
+      }
+    }"""
+    for fo_id in open_ids:
+        try:
+            data = shopify_graphql(mutation, {
+                "id": f"gid://shopify/FulfillmentOrder/{fo_id}",
+                "hold": {"reason": "OTHER", "reasonNotes": note, "notifyMerchant": False},
+            })
+        except Exception as e:
+            print(f"  [!] Could not put Shopify ID {shopify_order_id} on hold: {e}")
+            return False
+        errors = (data.get("fulfillmentOrderHold") or {}).get("userErrors")
+        if errors:
+            print(f"  [!] Could not put Shopify ID {shopify_order_id} on hold: {errors}")
+            return False
+    return True
+
+
+def release_shopify_hold(fulfillment_order_id):
+    """Releases the holds on one fulfillment order. Returns True on success."""
+    mutation = """
+    mutation release($id: ID!) {
+      fulfillmentOrderReleaseHold(id: $id) {
+        fulfillmentOrder { id status }
+        userErrors { field message }
+      }
+    }"""
+    try:
+        data = shopify_graphql(mutation, {"id": f"gid://shopify/FulfillmentOrder/{fulfillment_order_id}"})
+    except Exception as e:
+        print(f"  [!] Could not release the hold on fulfillment order {fulfillment_order_id}: {e}")
+        return False
+    errors = (data.get("fulfillmentOrderReleaseHold") or {}).get("userErrors")
+    if errors:
+        print(f"  [!] Could not release the hold on fulfillment order {fulfillment_order_id}: {errors}")
+        return False
+    return True
+
+
+def ni_entry(receipt, state):
+    ship_by = get_etsy_ship_by_date(receipt)
+    return {
+        "receipt_id": str(receipt.get("receipt_id")),
+        "name": (receipt.get("name") or "").strip() or "unknown buyer",
+        "postcode": (receipt.get("zip") or "").strip().upper() or "no postcode",
+        "due": datetime.strptime(ship_by, "%Y-%m-%d").strftime("%a %d %b") if ship_by else "no date",
+        "state": state,
+    }
+
+
+def print_ni_banner():
+    """A hard-to-miss list of Northern Ireland orders that must be dispatched on Etsy."""
+    if not ni_held_orders:
+        return
+    line = "=" * 74
+    print(f"\n{line}")
+    print(f"  !!!  NORTHERN IRELAND: {len(ni_held_orders)} ORDER(S) TO DISPATCH ON ETSY  !!!")
+    print("  Buy the label and mark these as dispatched ON ETSY. Their Shopify orders")
+    print("  are ON HOLD (not unfulfilled) and complete themselves once Etsy shows them sent:")
+    print()
+    for item in ni_held_orders:
+        print(f"    Etsy #{item['receipt_id']}  |  {item['name']}  |  {item['postcode']}  |  due {item['due']}")
+    failed = [i for i in ni_held_orders if i["state"] == "hold_failed"]
+    if failed:
+        print()
+        print(f"  !!!  {len(failed)} of these could NOT be put on hold in Shopify: do not buy a label there:")
+        print("       " + ", ".join(f"#{i['receipt_id']}" for i in failed))
+    print()
+    print("  (They stay on this list on every import run until they are dispatched on Etsy.)")
+    print(line)
+
+
 def import_etsy_orders(args):
     print(f"\n--- Checking Unshipped Orders: Etsy -> Shopify (Dry Run: {args.dry_run}) ---")
+    ni_held_orders.clear()
     # Both lookups raise on failure: importing without them risks duplicates or unlinked items.
     sku_map = build_shopify_sku_map() if args.import_orders else {}
     existing_shopify_map = build_existing_shopify_receipt_map()
@@ -912,6 +1029,8 @@ def import_etsy_orders(args):
                     set_expected_ship_date(receipt_id, ship_by_date)
                 if in_db or existing_id:
                     save_order_details(receipt)
+            if args.exclude_ni and is_northern_ireland(receipt):
+                ni_held_orders.append(ni_entry(receipt, "already_in_shopify"))
             if args.backfill_deadlines and existing_id and fulfill_by_iso:
                 print(f"  [~] Backfilling 'Fulfill by' ({fulfill_by_iso}) for existing Order #{receipt_id} (Shopify ID: {existing_id})...")
                 if not args.dry_run:
@@ -925,11 +1044,17 @@ def import_etsy_orders(args):
         if not args.import_orders:
             continue
 
+        hold_ni = bool(args.exclude_ni and is_northern_ireland(receipt))
+
         print(f"\nProcessing Etsy Receipt #{receipt_id} for {receipt.get('name')}...")
+        if hold_ni:
+            print("  [NI] Northern Ireland: importing ON HOLD. Dispatch it on Etsy.")
         if row is not None:
             print(f"  [i] Previously skipped as cancelled, but its Etsy status is '{receipt.get('status')}' - importing.")
         payload = map_etsy_to_shopify(receipt, sku_map=sku_map)
         o_data = payload["order"]
+        if hold_ni:
+            o_data["tags"] = f"{o_data['tags']}, {NI_TAG}"
         unlinked = [i.get("sku", "no SKU") for i in o_data["line_items"] if "variant_id" not in i]
 
         if args.dry_run:
@@ -941,6 +1066,9 @@ def import_etsy_orders(args):
             print(f"  [DRY RUN] Etsy shipping fields: {get_etsy_shipping_choices(receipt) or 'none sent'}")
             if o_data.get("discount_codes"):
                 print(f"  [DRY RUN] Discount: £{o_data['discount_codes'][0]['amount']}")
+            if hold_ni:
+                print("  [DRY RUN] Northern Ireland: would be imported ON HOLD (tag: " + NI_TAG + ")")
+                ni_held_orders.append(ni_entry(receipt, "would_hold"))
             for item in o_data["line_items"]:
                 var_info = f" [Variant ID: {item['variant_id']}]" if "variant_id" in item else " [Unlinked SKU]"
                 props = f" | Options: {item.get('properties')}" if item.get("properties") else ""
@@ -966,10 +1094,18 @@ def import_etsy_orders(args):
                 set_shopify_fulfill_by(shopify_id, fulfill_by_iso)
             except Exception as e:
                 print(f"  [!] Order created, but setting 'Fulfill by' failed ({e}). Run --backfill-deadlines later.")
+        if hold_ni:
+            if hold_shopify_order(shopify_id):
+                print("  [+] Put the order ON HOLD in Shopify (dispatch it on Etsy).")
+                ni_held_orders.append(ni_entry(receipt, "held"))
+            else:
+                print("  [!!!] COULD NOT PUT THIS ORDER ON HOLD. Do not buy a label for it in Shopify; dispatch it on Etsy.")
+                ni_held_orders.append(ni_entry(receipt, "hold_failed"))
 
     print(f"\nOrder Import Summary -> Created: {created_count} | Backfilled: {backfilled_count} | "
           f"Skipped (Existing): {skipped_existing} | Failed: {failed_import} | "
-          f"Cancelled after import: {cancelled_after_import}")
+          f"Cancelled after import: {cancelled_after_import}"
+          + (f" | Northern Ireland on hold: {len(ni_held_orders)}" if args.exclude_ni else ""))
 
 
 # =====================================================================
@@ -1199,8 +1335,14 @@ def fulfill_shopify_order(shopify_order_id, tracking_code, carrier):
         print(f"  [!] Could not read fulfillment orders for Shopify ID {shopify_order_id} "
               f"({resp.status_code}): {resp.text}")
         return "failed"
-    open_ids = [fo["id"] for fo in resp.json().get("fulfillment_orders", [])
-                if fo.get("status") in ("open", "in_progress")]
+    fulfillment_orders = resp.json().get("fulfillment_orders", [])
+    open_ids = [fo["id"] for fo in fulfillment_orders if fo.get("status") in ("open", "in_progress")]
+    # Orders held for Northern Ireland: Etsy shows them dispatched, so release the hold first.
+    for fo in fulfillment_orders:
+        if fo.get("status") == "on_hold":
+            if not release_shopify_hold(fo["id"]):
+                return "failed"
+            open_ids.append(fo["id"])
     if not open_ids:
         return "already"
 
@@ -1407,6 +1549,8 @@ def main(argv=None):
     parser.add_argument("--backfill-deadlines", action="store_true", help="Update 'Fulfill by' deadlines on already-imported unshipped orders.")
     parser.add_argument("--tracking-only", action="store_true", help="Only push fulfilled tracking numbers from Shopify to Etsy (default behavior).")
     parser.add_argument("--force-dispatch", action="store_true", help="Mark orders dispatched on Etsy now, even before their ship-by date.")
+    parser.add_argument("--exclude-ni", "--excludeNI", "--hold-ni", dest="exclude_ni", action="store_true",
+                        help="Import orders going to Northern Ireland (BT postcodes) ON HOLD instead of unfulfilled, and list them so you can dispatch them on Etsy.")
     args = parser.parse_args(argv)
 
     console = sys.stdout
@@ -1424,6 +1568,7 @@ def main(argv=None):
         if not args.dry_run:
             backup_database()
         print("\n--- Sync Complete ---")
+        print_ni_banner()
     except Exception:
         print("\n[!!!] The sync stopped with an error:")
         traceback.print_exc(file=sys.stdout)

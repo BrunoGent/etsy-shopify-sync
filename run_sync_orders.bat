@@ -1,5 +1,5 @@
 @echo off
 cd /d "%~dp0"
-python sync.py --import-orders
+python sync.py --import-orders --exclude-ni
 echo.
 pause

@@ -72,7 +72,7 @@ Etsy's API does not provide buyer email addresses, so the email column stays emp
 
 ## A typical day
 
-1. **Before packing:** run `run_sync_orders.bat`. New Etsy orders appear in Shopify.
+1. **Before packing:** run `run_sync_orders.bat`. New Etsy orders appear in Shopify. Orders for Northern Ireland are imported **on hold** (so they are not on your pack list) and listed in a boxed warning at the end of the run. Buy those labels on Etsy and dispatch them there; the Shopify order then completes itself.
 2. Pack, and buy your labels in Shopify as usual.
 3. **After buying labels:** run `run_tracking.bat`. Etsy orders due today are marked dispatched; ones bought early are held.
 
@@ -115,6 +115,7 @@ With **no options at all**, `python sync.py` only syncs tracking (Shopify → Et
 | Option | What it does | When to use it |
 | --- | --- | --- |
 | `--import-orders` | Copies new Etsy orders into Shopify **first**, then syncs tracking as usual. | Before packing. This is what `run_sync_orders.bat` runs. |
+| `--exclude-ni` | Used with `--import-orders`. Imports orders going to Northern Ireland (postcodes starting `BT`) **on hold** instead of unfulfilled, tagged `NI - dispatch on Etsy`, and lists them in a boxed warning at the end of every run until they are dispatched. Buy the label and dispatch on Etsy; the next sync then releases the hold and marks the Shopify order fulfilled. Also accepted as `--excludeNI` or `--hold-ni`. | Royal Mail labels bought through Shopify cannot be used for Northern Ireland. `run_sync_orders.bat` already includes it. |
 | `--tracking-only` | Syncs tracking and nothing else, even if other options ask for an import. | After buying labels. This is what `run_tracking.bat` runs. |
 | `--dry-run` | A rehearsal. Prints exactly what *would* happen, but creates no orders, sends nothing to Etsy and saves nothing. | Any time you are unsure, after changing a setting, or on first use. Add it to any command. |
 | `--force-dispatch` | Marks orders dispatched on Etsy **now**, even if their ship-by date is still in the future. | You posted early and want buyers to get their tracking today. |
@@ -127,6 +128,7 @@ With **no options at all**, `python sync.py` only syncs tracking (Shopify → Et
 | --- | --- |
 | See what an import would do, without doing it | `python sync.py --import-orders --dry-run` |
 | Import new orders | `python sync.py --import-orders` |
+| Import new orders, holding Northern Ireland ones | `python sync.py --import-orders --exclude-ni` |
 | See which orders would be marked dispatched | `python sync.py --tracking-only --dry-run` |
 | Send tracking for orders that are due | `python sync.py --tracking-only` |
 | Send tracking for everything with a label, due or not | `python sync.py --tracking-only --force-dispatch` |
