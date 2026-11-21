@@ -76,6 +76,15 @@ Etsy's API does not provide buyer email addresses, so the email column stays emp
 2. Pack, and buy your labels in Shopify as usual.
 3. **After buying labels:** run `run_tracking.bat`. Etsy orders due today are marked dispatched; ones bought early are held.
 
+### Optional: run it automatically every day
+
+`run_sync_scheduled.bat` runs the normal import (`python sync.py --import-orders --exclude-ni`) with no pause, and `run_sync_hidden.vbs` starts it without showing a window. Point a **Windows Task Scheduler** task at `wscript.exe "<folder>\run_sync_hidden.vbs"` (for example daily at 08:00) to have the sync run by itself. It does exactly what the manual run does, including marking orders dispatched on Etsy once their ship-by date arrives.
+
+- Nothing is shown on screen. Read `logs/YYYY-MM-DD.log` to see what happened, and look for the Northern Ireland warning there.
+- Task Scheduler only runs it while you are signed in to the PC (unless you set the task up otherwise).
+- Do not start a manual run at the same moment as a scheduled one.
+- `run_sync_hidden.vbs` contains the folder path `C:\etsy-shopify-sync`. Edit it if you keep the project somewhere else.
+
 ---
 
 ## Commands
@@ -254,6 +263,8 @@ Postage upgrades are detected from the name of the Etsy shipping upgrade the buy
 | `auth.py` | One-time Etsy sign-in |
 | `push_all_tracking.py` | Old name for the tracking sync; now just calls `sync.py --tracking-only` |
 | `run_sync_orders.bat`, `run_tracking.bat` | Double-click shortcuts for Windows |
+| `Force tracking.bat` | Shortcut for `--tracking-only --force-dispatch`: mark everything with a label as dispatched on Etsy now |
+| `run_sync_scheduled.bat`, `run_sync_hidden.vbs` | The windowless run used by Windows Task Scheduler |
 | `.env.example` | Template for your settings |
 | `dispatch_note.example.txt` | Template for the buyer dispatch note |
 
