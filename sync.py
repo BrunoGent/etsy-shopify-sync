@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import sys
 import time
 import sqlite3
@@ -437,6 +438,18 @@ def add_shopify_order_tag(shopify_order_id, tag):
 # STEP 1: ETSY -> SHOPIFY ORDER IMPORT & DEADLINES
 # =====================================================================
 
+def clean_receipt(value):
+    """Etsy sends some text HTML-escaped (Queen&#39;s Road, Tom &amp; Jerry). Decodes every
+    string in a receipt so addresses, names, notes and titles arrive as plain text."""
+    if isinstance(value, str):
+        return html.unescape(value)
+    if isinstance(value, list):
+        return [clean_receipt(v) for v in value]
+    if isinstance(value, dict):
+        return {k: clean_receipt(v) for k, v in value.items()}
+    return value
+
+
 def fetch_etsy_receipts(max_receipts=500):
     """Fetches all paid, unshipped Etsy receipts (cancelled ones included), 100 per page."""
     url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts"
@@ -454,7 +467,7 @@ def fetch_etsy_receipts(max_receipts=500):
         if resp.status_code != 200:
             raise Exception(f"Failed to fetch Etsy orders ({resp.status_code}): {resp.text}")
         results = resp.json().get("results", [])
-        receipts.extend(results)
+        receipts.extend(clean_receipt(r) for r in results)
         if len(results) < page_size:
             break
         offset += page_size
@@ -1374,6 +1387,7 @@ def fetch_recent_shipped_receipts(pages=1):
             raise Exception(f"Failed to fetch dispatched Etsy receipts ({resp.status_code}): {resp.text}")
         results = resp.json().get("results", [])
         for receipt in results:
+            receipt = clean_receipt(receipt)
             found[str(receipt.get("receipt_id"))] = receipt
             ts = receipt.get("create_timestamp") or receipt.get("created_timestamp")
             if ts:
@@ -1424,7 +1438,7 @@ def sync_etsy_dispatch_to_shopify(dry_run=False):
                     print(f"  [!] Could not check Etsy #{receipt_id}: {resp.status_code} -> {resp.text}")
                     failed += 1
                     continue
-                receipt = resp.json()
+                receipt = clean_receipt(resp.json())
             if not receipt.get("is_shipped"):
                 continue
 

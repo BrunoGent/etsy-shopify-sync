@@ -43,7 +43,7 @@ def fetch_all_receipts(max_receipts=None):
             if max_receipts is not None and fetched >= max_receipts:
                 return
             fetched += 1
-            yield receipt
+            yield sync.clean_receipt(receipt)
         print(f"  ...read {fetched} of {data.get('count', '?')} orders")
         if len(results) < PAGE_SIZE:
             return
