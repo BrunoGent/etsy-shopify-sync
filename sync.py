@@ -850,7 +850,7 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
 
     if receipt.get("is_gift"):
         tags.append("Gift")
-        notes.append("🎁 GIFT ORDER (Do not show prices on packing slip)")
+        notes.append("🎁 GIFT ORDER")
         if receipt.get("gift_message"):
             notes.append(f"Gift Message:\n{receipt.get('gift_message')}")
 
