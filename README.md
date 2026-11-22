@@ -22,7 +22,7 @@ Built for a UK shop shipping with Royal Mail, but the carrier names and shipping
   - the buyer's name and delivery address
   - the original Etsy purchase date
   - the Etsy discount, so the Shopify total equals what the buyer actually paid
-  - gift flag (tag `Gift`), gift message and buyer message in the order **notes**, which Shopify prints on the packing slip. An order with neither has no note. The order is named with the Etsy receipt number, which is how the sync finds it again
+  - the **gift message** and the buyer's message in the order **notes** (a gift order with no message gets only the tag `Gift`; one with a message also gets the tag `Gift message` and the note line `GIFT MESSAGE (print from Etsy):`). A plain order has no note. The order is named with the Etsy receipt number, which is how the sync finds it again
   - tags: `Etsy`, `ShipBy:YYYY-MM-DD`, plus `Tracked 24, Priority` for upgraded postage, `Gift`, `International`
   - **repeat buyers:** `Repeat customer` and `Repeat order N` (N = this buyer's Nth order). Etsy gives no buyer email, so Shopify cannot tell a buyer has ordered before; the sync works it out from its own order history instead (see [Repeat customers](#repeat-customers))
 - Sets Shopify's **"Fulfill by"** date from Etsy's dispatch deadline, so you can sort by what is due.
@@ -66,6 +66,7 @@ Etsy's API does not provide buyer email addresses, so the email column stays emp
 ### 5. Housekeeping on every run
 
 - **Due list:** orders due today or overdue that are still not dispatched on Etsy.
+- **Gift messages:** at the very end, a box lists imported orders with a gift message that are not yet dispatched, as a reminder to print the gift message from Etsy.
 - **Run log:** everything printed is also saved to `logs/YYYY-MM-DD.log` (kept for 90 days).
 - **Backup:** `orders.db` is copied to a `backups` folder as `orders-YYYY-MM-DD.db` and the newest 30 are kept. You can point this at a cloud folder instead (see [Backups](#backups)).
 

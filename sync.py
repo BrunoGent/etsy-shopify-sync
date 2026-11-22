@@ -848,11 +848,14 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
     # which prints on the packing slip. Plain orders therefore have no note at all.
     notes = []
 
-    if receipt.get("is_gift"):
+    # A gift order with no message needs nothing special (tag only). A gift MESSAGE is printed from Etsy
+    # (Etsy makes the A4 page), so the note says so; the label stamper looks for these words on the slip.
+    gift_message = (receipt.get("gift_message") or "").strip()
+    if receipt.get("is_gift") or gift_message:
         tags.append("Gift")
-        notes.append("🎁 GIFT ORDER")
-        if receipt.get("gift_message"):
-            notes.append(f"Gift Message:\n{receipt.get('gift_message')}")
+    if gift_message:
+        tags.append("Gift message")
+        notes.append(f"GIFT MESSAGE (print from Etsy):\n{gift_message}")
 
     if receipt.get("message_from_buyer"):
         notes.append(f"Buyer Note:\n{receipt.get('message_from_buyer')}")
@@ -1611,6 +1614,31 @@ def print_due_orders():
         print(f"  [{when}] Etsy #{receipt_id}{' - ' + name if name else ''}")
 
 
+def print_gift_messages():
+    """Lists imported orders that carry a gift message and are not yet dispatched, as a reminder to
+    print the gift message from Etsy (Etsy generates that A4 page; this program cannot)."""
+    today = date.today().isoformat()
+    rows = _db_query("""
+        SELECT etsy_receipt_id, expected_ship_date, buyer_name FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+          AND TRIM(COALESCE(gift_message, '')) <> ''
+          AND (order_date IS NULL OR order_date >= date(?, '-21 days'))
+        ORDER BY expected_ship_date IS NULL, expected_ship_date
+    """, (today,))
+    if not rows:
+        return
+    line = "=" * 74
+    print(f"\n{line}")
+    print(f"  GIFT MESSAGES: {len(rows)} order(s) to print from Etsy before they are posted")
+    print()
+    for receipt_id, ship_by, name in rows:
+        due = datetime.strptime(ship_by, "%Y-%m-%d").strftime("%a %d %b") if ship_by else "no date"
+        print(f"    Etsy #{receipt_id}  |  {name or 'unknown buyer'}  |  due {due}")
+    print()
+    print("  (Listed until the order is dispatched on Etsy.)")
+    print(line)
+
+
 def backup_database():
     """Copies orders.db into BACKUP_DIR as orders-YYYY-MM-DD.db and keeps the newest BACKUP_KEEP.
     Never raises: a failed backup must not look like a failed sync."""
@@ -1669,6 +1697,7 @@ def main(argv=None):
         if not args.dry_run:
             backup_database()
         print("\n--- Sync Complete ---")
+        print_gift_messages()
         print_ni_banner()
     except Exception:
         print("\n[!!!] The sync stopped with an error:")
