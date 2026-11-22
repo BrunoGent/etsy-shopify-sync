@@ -22,7 +22,7 @@ Built for a UK shop shipping with Royal Mail, but the carrier names and shipping
   - the buyer's name and delivery address
   - the original Etsy purchase date
   - the Etsy discount, so the Shopify total equals what the buyer actually paid
-  - gift flag, gift message and buyer note in the order notes
+  - gift flag (tag `Gift`), gift message and buyer message in the order **notes**, which Shopify prints on the packing slip. An order with neither has no note. The order is named with the Etsy receipt number, which is how the sync finds it again
   - tags: `Etsy`, `ShipBy:YYYY-MM-DD`, plus `Tracked 24, Priority` for upgraded postage, `Gift`, `International`
   - **repeat buyers:** `Repeat customer` and `Repeat order N` (N = this buyer's Nth order). Etsy gives no buyer email, so Shopify cannot tell a buyer has ordered before; the sync works it out from its own order history instead (see [Repeat customers](#repeat-customers))
 - Sets Shopify's **"Fulfill by"** date from Etsy's dispatch deadline, so you can sort by what is due.

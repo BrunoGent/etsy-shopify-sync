@@ -843,9 +843,10 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
     processed_at_iso = get_etsy_purchase_iso(receipt)
 
     # 3. Compile Notes
-    notes = [f"Imported from Etsy. Receipt ID: {receipt_id}"]
-    if discount_amt > 0:
-        notes[0] += f". Etsy discount: £{discount_amt:.2f}"
+    # Only things the packer needs to read. The order NAME is the Etsy receipt number (that is how the
+    # sync finds the order again) and the discount is on the order itself, so neither goes in the note,
+    # which prints on the packing slip. Plain orders therefore have no note at all.
+    notes = []
 
     if receipt.get("is_gift"):
         tags.append("Gift")
@@ -911,8 +912,9 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
         ],
         "transactions": [transaction_entry],
         "tags": ", ".join(tags),
-        "note": "\n\n".join(notes)
     }
+    if notes:
+        order_data["note"] = "\n\n".join(notes)
 
     if processed_at_iso:
         order_data["processed_at"] = processed_at_iso
