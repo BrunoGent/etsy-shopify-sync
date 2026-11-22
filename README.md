@@ -84,7 +84,7 @@ Etsy's API does not provide buyer email addresses, so the email column stays emp
 - Nothing is shown on screen. Read `logs/YYYY-MM-DD.log` to see what happened, and look for the Northern Ireland warning there.
 - Task Scheduler only runs it while you are signed in to the PC (unless you set the task up otherwise).
 - Do not start a manual run at the same moment as a scheduled one.
-- `run_sync_hidden.vbs` contains the folder path `C:\etsy-shopify-sync`. Edit it if you keep the project somewhere else.
+- `run_sync_hidden.vbs` contains the folder path `C:\beemine-automations\etsy-shopify-sync`. Edit it if you keep the project somewhere else.
 
 ---
 
