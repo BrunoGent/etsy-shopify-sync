@@ -24,6 +24,7 @@ Built for a UK shop shipping with Royal Mail, but the carrier names and shipping
   - the Etsy discount, so the Shopify total equals what the buyer actually paid
   - gift flag, gift message and buyer note in the order notes
   - tags: `Etsy`, `ShipBy:YYYY-MM-DD`, plus `Tracked 24, Priority` for upgraded postage, `Gift`, `International`
+  - **repeat buyers:** `Repeat customer` and `Repeat order N` (N = this buyer's Nth order). Etsy gives no buyer email, so Shopify cannot tell a buyer has ordered before; the sync works it out from its own order history instead (see [Repeat customers](#repeat-customers))
 - Sets Shopify's **"Fulfill by"** date from Etsy's dispatch deadline, so you can sort by what is due.
 - **Never creates duplicates.** Each order is checked against the local database and against recent Shopify orders.
 - **Handles cancellations.**
@@ -86,6 +87,16 @@ Etsy's API does not provide buyer email addresses, so the email column stays emp
 - `run_sync_hidden.vbs` contains the folder path `C:\etsy-shopify-sync`. Edit it if you keep the project somewhere else.
 
 ---
+
+## Repeat customers
+
+Etsy marks repeat buyers with a star; Shopify cannot, because Etsy hides buyer emails and Shopify matches customers by email. So the sync does it:
+
+- Every order saved in `orders.db` keeps Etsy's `buyer_user_id` (an id Etsy does share). `backfill_orders.py` fills it in for past orders.
+- When an order is imported, the sync counts the same buyer's **earlier, non-cancelled** orders in `orders.db` (and any other orders in the same import run). If there are any, the Shopify order gets the tags `Repeat customer` and `Repeat order N`. A receipt with no buyer id falls back to buyer name + postcode.
+- Only Etsy orders are compared; other channels are not matched.
+- `python sync.py --tag-repeats` (add `--dry-run` to preview) tags orders that were imported earlier and are not yet dispatched.
+- To print it on the packing slip, the shop's packing slip template reads these tags; it is kept in its own repository, `shopify-packing-slip` (see `docs/shopify-packing-slip-repeat.txt`).
 
 ## Commands
 
@@ -272,5 +283,6 @@ Postage upgrades are detected from the name of the Etsy shipping upgrade the buy
 
 - **"Failed to refresh Etsy token"**: run `python auth.py` again to sign in.
 - **An item shows `[Unlinked SKU]`**: the SKU on Etsy does not exactly match one in Shopify.
+- **A repeat buyer is not tagged**: run `python backfill_orders.py` once so every past order has a buyer id, then `python sync.py --tag-repeats` for orders already in Shopify.
 - **An order is "held"**: its ship-by date is in the future. Run again on that date or use `--force-dispatch`.
 - **Something looks wrong**: open the latest file in `logs/` to see exactly what the last run did.

@@ -50,12 +50,14 @@ EXPRESS_KEYWORDS = ("24", "express", "first", "1st", "next day", "priority")
 CANCELLED_TAG = "Etsy Cancelled"
 
 # Order detail columns on synced_orders, filled by save_order_details() for new orders
-# (during import) and for past orders (backfill_orders.py). The sync never reads these
-# to make decisions; they are a record of the order as Etsy described it.
+# (during import) and for past orders (backfill_orders.py). They are a record of the order
+# as Etsy described it. The only decision made from them is the repeat-customer flag
+# (previous_order_count: buyer_user_id, or name + postcode when that is missing).
 ORDER_DETAIL_COLUMNS = {
     "order_date": "TEXT",          # purchase time, UTC, YYYY-MM-DD HH:MM:SS
     "etsy_status": "TEXT",         # Etsy's own status: Paid, Completed, Canceled, ...
     "buyer_name": "TEXT",
+    "buyer_user_id": "TEXT",       # Etsy's id for the buyer; the key for repeat-customer checks
     "buyer_email": "TEXT",
     "address_line1": "TEXT",
     "address_line2": "TEXT",
@@ -609,6 +611,7 @@ def extract_order_details(receipt):
         "order_date": _utc_str(receipt.get("create_timestamp") or receipt.get("created_timestamp")),
         "etsy_status": receipt.get("status"),
         "buyer_name": (receipt.get("name") or "").strip() or None,
+        "buyer_user_id": str(receipt["buyer_user_id"]) if receipt.get("buyer_user_id") else None,
         "buyer_email": email or None,
         "address_line1": receipt.get("first_line"),
         "address_line2": receipt.get("second_line"),
@@ -645,6 +648,83 @@ def save_order_details(receipt):
     _db_execute(
         f"UPDATE synced_orders SET {assignments}, details_updated_at = CURRENT_TIMESTAMP WHERE etsy_receipt_id = ?",
         tuple(details.values()) + (str(receipt.get("receipt_id")),))
+
+
+REPEAT_TAG = "Repeat customer"
+REPEAT_ORDER_TAG = "Repeat order"   # followed by the order number, e.g. "Repeat order 3"
+
+
+def _norm_text(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def previous_order_count(receipt, batch=(), when=None):
+    """How many EARLIER, non-cancelled Etsy orders the same buyer has.
+
+    The buyer is identified by Etsy's buyer_user_id; if a receipt has none, by name + postcode.
+    Counts rows in orders.db (the whole shop history) plus any receipts in `batch` (the orders
+    being imported in this same run) that are not in the database yet. Etsy only; other
+    channels are not matched. Returns 0 when the order's date is unknown.
+    """
+    receipt_id = str(receipt.get("receipt_id"))
+    when = when or _utc_str(receipt.get("create_timestamp") or receipt.get("created_timestamp"))
+    if not when:
+        return 0
+    uid = str(receipt["buyer_user_id"]) if receipt.get("buyer_user_id") else None
+    base = ("SELECT etsy_receipt_id, buyer_name, postcode FROM synced_orders WHERE etsy_receipt_id != ? "
+            "AND order_date < ? AND COALESCE(status, '') NOT LIKE 'CANCEL%'")
+    if uid:
+        rows = _db_query(base + " AND buyer_user_id = ?", (receipt_id, when, uid))
+        count = len(rows)
+    else:
+        name, post = _norm_text(receipt.get("name")), _norm_text(receipt.get("zip"))
+        if not name or not post:
+            return 0
+        rows = _db_query(base, (receipt_id, when))
+        count = sum(1 for r in rows if _norm_text(r[1]) == name and _norm_text(r[2]) == post)
+    for other in batch:
+        oid = str(other.get("receipt_id"))
+        if oid == receipt_id or get_synced_row(oid) is not None:
+            continue
+        other_when = _utc_str(other.get("create_timestamp") or other.get("created_timestamp"))
+        if not other_when or other_when >= when:
+            continue
+        same = (uid and str(other.get("buyer_user_id")) == uid) or (
+            not uid and _norm_text(other.get("name")) == _norm_text(receipt.get("name"))
+            and _norm_text(other.get("zip")) == _norm_text(receipt.get("zip")))
+        if same:
+            count += 1
+    return count
+
+
+def repeat_tags(prior):
+    """Shopify tags for an order that is the buyer's (prior + 1)th; none for a first order."""
+    return [REPEAT_TAG, f"{REPEAT_ORDER_TAG} {prior + 1}"] if prior > 0 else []
+
+
+def tag_repeat_customers(dry_run=False):
+    """One-off: tags the already-imported, not-yet-dispatched orders that are repeat orders."""
+    print(f"\n--- Tagging repeat customers on open Shopify orders (Dry Run: {dry_run}) ---")
+    rows = _db_query("""
+        SELECT etsy_receipt_id, shopify_order_id, buyer_user_id, buyer_name, postcode, order_date
+        FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+          AND shopify_order_id IS NOT NULL AND shopify_order_id != '' AND order_date IS NOT NULL""")
+    tagged = checked = 0
+    for rid, shopify_id, uid, name, post, order_date in rows:
+        if not uid:
+            print(f"  [!] Etsy #{rid} has no buyer id in orders.db; run backfill_orders.py first. Skipped.")
+            continue
+        checked += 1
+        prior = previous_order_count({"receipt_id": rid, "buyer_user_id": uid, "name": name, "zip": post},
+                                     when=order_date)
+        if prior > 0:
+            print(f"  [+] Etsy #{rid}: order {prior + 1} for this buyer -> {', '.join(repeat_tags(prior))}")
+            if not dry_run:
+                for tag in repeat_tags(prior):
+                    add_shopify_order_tag(_numeric_id(shopify_id), tag)
+            tagged += 1
+    print(f"Checked {checked} open order(s): {tagged} repeat.")
 
 
 def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
@@ -700,7 +780,7 @@ def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
         print(f"  [!] Failed to set 'Fulfill by' deadline ({g_resp.status_code}): {g_resp.text}")
 
 
-def map_etsy_to_shopify(receipt, sku_map=None):
+def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
     if sku_map is None:
         sku_map = {}
 
@@ -754,7 +834,7 @@ def map_etsy_to_shopify(receipt, sku_map=None):
     grandtotal = parse_money(receipt.get("grandtotal")) or max(0.0, items_subtotal + shipping_cost - discount_amt)
 
     # 2. Build Tags & Extract Dates
-    tags = ["Etsy"] + shipping["tags"]
+    tags = ["Etsy"] + shipping["tags"] + repeat_tags(previous_order_count(receipt, batch or ()))
 
     ship_by_str = get_etsy_ship_by_date(receipt)
     if ship_by_str:
@@ -1064,7 +1144,7 @@ def import_etsy_orders(args):
             print("  [NI] Northern Ireland: importing ON HOLD. Dispatch it on Etsy.")
         if row is not None:
             print(f"  [i] Previously skipped as cancelled, but its Etsy status is '{receipt.get('status')}' - importing.")
-        payload = map_etsy_to_shopify(receipt, sku_map=sku_map)
+        payload = map_etsy_to_shopify(receipt, sku_map=sku_map, batch=orders)
         o_data = payload["order"]
         if hold_ni:
             o_data["tags"] = f"{o_data['tags']}, {NI_TAG}"
@@ -1565,12 +1645,17 @@ def main(argv=None):
     parser.add_argument("--force-dispatch", action="store_true", help="Mark orders dispatched on Etsy now, even before their ship-by date.")
     parser.add_argument("--exclude-ni", "--excludeNI", "--hold-ni", dest="exclude_ni", action="store_true",
                         help="Import orders going to Northern Ireland (BT postcodes) ON HOLD instead of unfulfilled, and list them so you can dispatch them on Etsy.")
+    parser.add_argument("--tag-repeats", action="store_true",
+                        help="Tag already-imported, not-yet-dispatched orders from repeat Etsy buyers (Repeat customer, Repeat order N), then exit.")
     args = parser.parse_args(argv)
 
     console = sys.stdout
     logfile = start_run_log(sys.argv[1:] if argv is None else argv)
     try:
         init_db()
+        if args.tag_repeats:
+            tag_repeat_customers(dry_run=args.dry_run)
+            return
         ensure_etsy_token()
 
         if (args.import_orders or args.backfill_deadlines) and not args.tracking_only:

@@ -1,0 +1,8 @@
+Repeat-customer line on the Shopify packing slip
+================================================
+
+The packing slip template now lives in its own project/repository:
+    C:\shopify-packing-slip   (GitHub: BrunoGent/shopify-packing-slip)
+See packing-slip.liquid there: it already contains the block that turns this sync's tags
+("Etsy", "Repeat customer", "Repeat order N") into "REPEAT CUSTOMER (Order #N)" on the slip.
+Keep the tag names exactly as the sync writes them.
