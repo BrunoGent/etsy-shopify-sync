@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Etsy order email capture (local)",
+  "version": "1.0",
+  "description": "Reads buyer emails already shown on your Etsy Orders page and saves them to a listener on this PC. Makes no requests to Etsy.",
+  "host_permissions": ["http://127.0.0.1:8765/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.etsy.com/your/orders/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

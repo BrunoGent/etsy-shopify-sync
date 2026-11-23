@@ -61,7 +61,14 @@ Everything is recorded in `orders.db` (SQLite), one row per Etsy order: status, 
 - `python reports.py` prints sales by year and month, best-selling products (packs sold and total pieces, e.g. 10 packs of 20 tealights = 200 pieces), top customers by spend, and repeat customers. `--top N` sets the list length.
 - `python reports.py --export orders.csv` saves every order to a spreadsheet file.
 
-Etsy's API does not provide buyer email addresses, so the email column stays empty. Nothing in the sync needs it.
+Etsy's API does not provide buyer email addresses, so the email column starts empty. Nothing in the sync needs it.
+
+**Optional: capture buyer emails as you browse (`email_server.py` + `email_capture/`).** Etsy shows the buyer's email on your own Orders page. The Chrome extension in `email_capture/` reads what is already on the page you have open and sends it to a listener on your own PC. It makes no requests to Etsy and does not click or visit anything; it only sees pages you open yourself.
+1. Run `python email_server.py` and leave it open (it only accepts connections from this PC and only from the extension).
+2. In Chrome: `chrome://extensions` -> Developer mode -> Load unpacked -> choose the `email_capture` folder.
+3. Open Etsy -> Orders. Each page you view (use the 50-per-page setting) is captured. `python email_server.py --stats` shows the totals.
+
+Emails land in `etsy_emails` (per order, which the sync already reads) and `buyer_emails` (per Etsy buyer, for linking repeat customers later). Use them for fulfilment and customer service; marketing needs the customer's consent.
 
 ### 5. Housekeeping on every run
 
@@ -272,6 +279,7 @@ Postage upgrades are detected from the name of the Etsy shipping upgrade the buy
 | `sync.py` | The sync itself: import, tracking, housekeeping |
 | `backfill_orders.py` | Downloads past Etsy orders into the database |
 | `reports.py` | Reports and CSV export |
+| `email_server.py`, `email_capture/` | Optional: local listener and Chrome extension that save buyer emails shown on your Etsy Orders pages |
 | `auth.py` | One-time Etsy sign-in |
 | `push_all_tracking.py` | Old name for the tracking sync; now just calls `sync.py --tracking-only` |
 | `run_sync_orders.bat`, `run_tracking.bat` | Double-click shortcuts for Windows |
