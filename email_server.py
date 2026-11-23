@@ -120,7 +120,7 @@ def stats():
 
 
 def missing(limit):
-    """Top customers by total spend who still have no email stored."""
+    """The highest-spending customers who still have no email stored (always N of them)."""
     init_tables()
     groups = {}
     with closing(sqlite3.connect(sync.DB_PATH)) as conn:
@@ -138,9 +138,10 @@ def missing(limit):
         g["last"] = max(g["last"], (order_date or "")[:10])
         if uid in have_buyer or str(receipt) in have_receipt:
             g["email"] = True
-    ranked = sorted((g for g in groups.values() if g["name"].lower() != "me"), key=lambda g: -g["spent"])[:limit]
-    todo = [g for g in ranked if not g["email"]]
-    print(f"Of your top {limit} customers by spend, {len(ranked) - len(todo)} have an email and {len(todo)} do not.")
+    ranked = sorted((g for g in groups.values() if g["name"].lower() != "me"), key=lambda g: -g["spent"])
+    done = sum(1 for g in ranked if g["email"])
+    todo = [g for g in ranked if not g["email"]][:limit]
+    print(f"{done} customers already have an email. Next {len(todo)} by spend without one:")
     print("Search each name in Etsy Orders (set to All) with the extension on and email_server.py running:")
     print(f"{'Spent':>10}{'Orders':>7}  {'Last order':<11}{'Etsy buyer id':<14}Name")
     for g in todo:
@@ -151,7 +152,7 @@ def main():
     parser = argparse.ArgumentParser(description="Receive buyer emails from the Etsy capture extension.")
     parser.add_argument("--stats", action="store_true", help="Show how many emails are stored and exit.")
     parser.add_argument("--missing", nargs="?", type=int, const=25, metavar="N",
-                        help="List the top N customers by spend (default 25) who still have no email, then exit.")
+                        help="List the next N highest-spending customers (default 25) who still have no email, then exit.")
     args = parser.parse_args()
     if args.stats:
         return stats()
