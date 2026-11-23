@@ -122,7 +122,7 @@ def stats():
 def missing(limit):
     """The highest-spending customers who still have no email stored (always N of them)."""
     init_tables()
-    groups = {}
+    groups, person_has_email = {}, set()
     with closing(sqlite3.connect(sync.DB_PATH)) as conn:
         have_buyer = {r[0] for r in conn.execute("SELECT buyer_id FROM buyer_emails WHERE email <> ''")}
         have_receipt = {r[0] for r in conn.execute("SELECT receipt_id FROM etsy_emails WHERE email <> ''")}
@@ -131,14 +131,18 @@ def missing(limit):
             f"WHERE {SOLD} AND buyer_name IS NOT NULL").fetchall()
     for receipt, uid, name, postcode, total, order_date in rows:
         uid = str(uid) if uid else ""
-        key = uid or (name.strip().lower(), (postcode or "").replace(" ", "").upper())
-        g = groups.setdefault(key, {"n": 0, "spent": 0.0, "name": name.strip(), "uid": uid, "last": "", "email": False})
+        person = (name.strip().lower(), (postcode or "").replace(" ", "").upper())
+        key = uid or person
+        g = groups.setdefault(key, {"person": person, "n": 0, "spent": 0.0, "name": name.strip(), "uid": uid, "last": "", "email": False})
         g["n"] += 1
         g["spent"] += total or 0
         g["last"] = max(g["last"], (order_date or "")[:10])
         if uid in have_buyer or str(receipt) in have_receipt:
             g["email"] = True
+            person_has_email.add(person)  # same name and postcode on another Etsy account counts too
     ranked = sorted((g for g in groups.values() if g["name"].lower() != "me"), key=lambda g: -g["spent"])
+    for g in ranked:
+        g["email"] = g["email"] or g["person"] in person_has_email
     done = sum(1 for g in ranked if g["email"])
     todo = [g for g in ranked if not g["email"]][:limit]
     print(f"{done} customers already have an email. Next {len(todo)} by spend without one:")
