@@ -67,6 +67,7 @@ Etsy's API does not provide buyer email addresses, so the email column starts em
 1. Run `python email_server.py` and leave it open (it only accepts connections from this PC and only from the extension).
 2. In Chrome: `chrome://extensions` -> Developer mode -> Load unpacked -> choose the `email_capture` folder.
 3. Open Etsy -> Orders. Each page you view (use the 50-per-page setting) is captured. `python email_server.py --stats` shows the totals, and `python email_server.py --missing` lists your top 25 customers by spend who still have no email (search each name in Orders to capture it; Etsy only lists about the last two months of orders, so older buyers need that search).
+4. After changing the extension, click its reload arrow on `chrome://extensions` and refresh (F5) the Etsy tab. Search results are captured too (the page rebuilds without reloading; the extension rescans every few seconds and retries if the listener was not running). Press F12 -> Console on the Etsy tab to see `[BeeMine email capture] saved N order(s)`.
 
 Emails land in `etsy_emails` (per order, which the sync already reads) and `buyer_emails` (per Etsy buyer, for linking repeat customers later). Use them for fulfilment and customer service; marketing needs the customer's consent.
 
