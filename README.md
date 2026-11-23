@@ -280,7 +280,7 @@ Postage upgrades are detected from the name of the Etsy shipping upgrade the buy
 | `sync.py` | The sync itself: import, tracking, housekeeping |
 | `backfill_orders.py` | Downloads past Etsy orders into the database |
 | `reports.py` | Reports and CSV export |
-| `email_server.py`, `email_capture/` | Optional: local listener and Chrome extension that save buyer emails shown on your Etsy Orders pages |
+| `email_server.py`, `email_capture/` (own README) | Optional: local listener and Chrome extension that save buyer emails shown on your Etsy Orders pages |
 | `auth.py` | One-time Etsy sign-in |
 | `push_all_tracking.py` | Old name for the tracking sync; now just calls `sync.py --tracking-only` |
 | `run_sync_orders.bat`, `run_tracking.bat` | Double-click shortcuts for Windows |
