@@ -22,6 +22,8 @@ import sync
 HOST, PORT = "127.0.0.1", 8765
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 MAX_BODY = 1_000_000
+# Orders that were really sold: everything except cancelled / fully refunded ones.
+SOLD = "status NOT IN ('CANCELLED', 'CANCELLED_AFTER_IMPORT') AND order_date IS NOT NULL"
 
 
 def init_tables():
@@ -117,12 +119,44 @@ def stats():
     print(f"Orders with an email: {orders:,}; buyers with an email: {buyers:,} of about {total:,} known buyers.")
 
 
+def missing(limit):
+    """Top customers by total spend who still have no email stored."""
+    init_tables()
+    groups = {}
+    with closing(sqlite3.connect(sync.DB_PATH)) as conn:
+        have_buyer = {r[0] for r in conn.execute("SELECT buyer_id FROM buyer_emails WHERE email <> ''")}
+        have_receipt = {r[0] for r in conn.execute("SELECT receipt_id FROM etsy_emails WHERE email <> ''")}
+        rows = conn.execute(
+            "SELECT etsy_receipt_id, buyer_user_id, buyer_name, postcode, grand_total, order_date FROM synced_orders "
+            f"WHERE {SOLD} AND buyer_name IS NOT NULL").fetchall()
+    for receipt, uid, name, postcode, total, order_date in rows:
+        uid = str(uid) if uid else ""
+        key = uid or (name.strip().lower(), (postcode or "").replace(" ", "").upper())
+        g = groups.setdefault(key, {"n": 0, "spent": 0.0, "name": name.strip(), "uid": uid, "last": "", "email": False})
+        g["n"] += 1
+        g["spent"] += total or 0
+        g["last"] = max(g["last"], (order_date or "")[:10])
+        if uid in have_buyer or str(receipt) in have_receipt:
+            g["email"] = True
+    ranked = sorted((g for g in groups.values() if g["name"].lower() != "me"), key=lambda g: -g["spent"])[:limit]
+    todo = [g for g in ranked if not g["email"]]
+    print(f"Of your top {limit} customers by spend, {len(ranked) - len(todo)} have an email and {len(todo)} do not.")
+    print("Search each name in Etsy Orders (set to All) with the extension on and email_server.py running:")
+    print(f"{'Spent':>10}{'Orders':>7}  {'Last order':<11}{'Etsy buyer id':<14}Name")
+    for g in todo:
+        print(f"{'£{:,.2f}'.format(g['spent']):>10}{g['n']:>7}  {g['last']:<11}{g['uid'] or '-':<14}{g['name']}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Receive buyer emails from the Etsy capture extension.")
     parser.add_argument("--stats", action="store_true", help="Show how many emails are stored and exit.")
+    parser.add_argument("--missing", nargs="?", type=int, const=25, metavar="N",
+                        help="List the top N customers by spend (default 25) who still have no email, then exit.")
     args = parser.parse_args()
     if args.stats:
         return stats()
+    if args.missing:
+        return missing(args.missing)
     init_tables()
     server = HTTPServer((HOST, PORT), Handler)
     print(f"Listening on http://{HOST}:{PORT} (this PC only). Open your Etsy Orders pages; press Ctrl+C to stop.")
