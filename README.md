@@ -58,7 +58,7 @@ Runs automatically at the start of every sync, with either shortcut.
 Everything is recorded in `orders.db` (SQLite), one row per Etsy order: status, Shopify order ID, tracking, order date, buyer name, address, items, totals, discount, postage upgrade, gift details and dispatch date.
 
 - `python backfill_orders.py` downloads your **whole Etsy order history** into it. It only reads from Etsy and never touches Shopify. Safe to re-run.
-- `python reports.py` prints sales by month, best-selling products and repeat customers.
+- `python reports.py` prints sales by year and month, best-selling products (packs sold and total pieces, e.g. 10 packs of 20 tealights = 200 pieces), top customers by spend, and repeat customers. `--top N` sets the list length.
 - `python reports.py --export orders.csv` saves every order to a spreadsheet file.
 
 Etsy's API does not provide buyer email addresses, so the email column stays empty. Nothing in the sync needs it.

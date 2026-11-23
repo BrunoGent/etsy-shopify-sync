@@ -1,7 +1,8 @@
 """Simple reports from orders.db. Reads the local database only; nothing is sent anywhere.
 
-    python reports.py                    # summary, monthly sales, top products, repeat customers
+    python reports.py                    # summary, yearly and monthly sales, top products (with pack totals), top customers, repeat customers
     python reports.py --months 36        # show more months
+    python reports.py --top 50           # longer product / customer lists
     python reports.py --export orders.csv   # save every order to a spreadsheet file
 
 Run backfill_orders.py first if you want the shop's full history included.
@@ -17,7 +18,8 @@ import sync
 
 # Orders that were really sold: everything except cancelled / fully refunded ones.
 SOLD = "status NOT IN ('CANCELLED', 'CANCELLED_AFTER_IMPORT') AND order_date IS NOT NULL"
-ITEM_LINE = re.compile(r"^(\d+)x (.*?)(?: \[(.*?)\])?(?: \(.*\))?$")
+ITEM_LINE = re.compile(r"^(\d+)x (.*?)(?: \[(.*?)\])?(?: \((.*)\))?$")
+PACK_SIZE = re.compile(r"Units(?: in pack)?: (\d+)")
 
 
 def query(sql, params=()):
@@ -50,23 +52,55 @@ def monthly(months):
         print(f"{month:<9}{orders:>8,}{items or 0:>8,}{'£{:,.2f}'.format(revenue or 0):>13}")
 
 
+def yearly():
+    rows = query(f"""
+        SELECT substr(order_date, 1, 4), COUNT(*), SUM(grand_total)
+        FROM synced_orders WHERE {SOLD} GROUP BY 1 ORDER BY 1""")
+    print("\n=== Sales by year ===")
+    print(f"{'Year':<7}{'Orders':>8}{'Takings':>13}{'Average':>10}")
+    for year, orders, revenue in rows:
+        revenue = revenue or 0
+        print(f"{year:<7}{orders:>8,}{'£{:,.2f}'.format(revenue):>13}{'£{:,.2f}'.format(revenue / orders):>10}")
+
+
 def top_products(limit):
-    units, orders, names = Counter(), Counter(), {}
+    packs, pieces, orders, names = Counter(), Counter(), Counter(), {}
     for (items,) in query(f"SELECT items FROM synced_orders WHERE {SOLD} AND items IS NOT NULL"):
         for line in items.splitlines():
             m = ITEM_LINE.match(line.strip())
             if not m:
                 continue
-            qty, title, sku = int(m.group(1)), m.group(2), m.group(3)
+            qty, title, sku, options = int(m.group(1)), m.group(2), m.group(3), m.group(4) or ""
             key = sku or title
-            units[key] += qty
+            size = PACK_SIZE.search(options)
+            packs[key] += qty
+            pieces[key] += qty * (int(size.group(1)) if size else 1)
             orders[key] += 1
             names[key] = title
-    print(f"\n=== Top {limit} products by units sold (grouped by SKU) ===")
-    print(f"{'Units':>7}{'Orders':>8}  Product")
-    for key, count in units.most_common(limit):
+    print(f"\n=== Top {limit} products by packs sold (grouped by SKU) ===")
+    print("Pieces = packs x pack size (20 tealights bought 10 times = 200 pieces).")
+    print(f"{'Packs':>7}{'Pieces':>8}{'Orders':>8}  Product")
+    for key, count in packs.most_common(limit):
         label = f"[{key}] {names[key]}" if key != names[key] else names[key]
-        print(f"{count:>7,}{orders[key]:>8,}  {label[:90]}")
+        print(f"{count:>7,}{pieces[key]:>8,}{orders[key]:>8,}  {label[:80]}")
+
+
+def top_customers(limit):
+    """Best customers by total spend. Etsy's buyer id when we have it, else name + postcode."""
+    groups = defaultdict(lambda: [0, 0.0, "", ""])
+    rows = query(f"SELECT buyer_user_id, buyer_name, postcode, grand_total, order_date FROM synced_orders WHERE {SOLD} AND buyer_name IS NOT NULL")
+    for uid, name, postcode, total, order_date in rows:
+        key = uid or (name.strip().lower(), (postcode or "").replace(" ", "").upper())
+        g = groups[key]
+        g[0] += 1
+        g[1] += total or 0
+        g[2] = name.strip()
+        g[3] = max(g[3], (order_date or "")[:10])
+    best = sorted(groups.values(), key=lambda g: -g[1])
+    print(f"\n=== Top {limit} customers by total spend ===")
+    print(f"{'Spent':>12}{'Orders':>8}  {'Last order':<12}Name")
+    for count, spent, name, last in best[:limit]:
+        print(f"{'£{:,.2f}'.format(spent):>12}{count:>8}  {last:<12}{name}")
 
 
 def repeat_customers(limit):
@@ -111,8 +145,10 @@ def main():
         export_csv(args.export)
         return
     if summary():
+        yearly()
         monthly(args.months)
         top_products(args.top)
+        top_customers(args.top)
         repeat_customers(args.top)
 
 
