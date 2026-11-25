@@ -1467,6 +1467,7 @@ def fetch_recent_shipped_receipts(pages=1):
     """
     url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts"
     found, oldest = {}, None
+    print("  Asking Etsy which orders were dispatched recently (one request; Etsy takes a few seconds)...")
     for page in range(pages):
         resp = etsy_request("GET", url, params={"was_paid": "true", "was_shipped": "true",
                                                 "limit": 100, "offset": page * 100})
