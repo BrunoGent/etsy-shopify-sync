@@ -371,16 +371,26 @@ def build_shopify_sku_map():
     }
     """
     sku_map = {}
+    spellings = {}
     cursor = None
     for _ in range(200):  # up to 50,000 variants
         page = shopify_graphql(query, {"cursor": cursor})["productVariants"]
         for node in page["nodes"]:
             sku = (node.get("sku") or "").strip()
             if sku:
-                sku_map[sku] = int(node["legacyResourceId"])
+                key = sku.lower()  # SKUs are matched ignoring capitals
+                vid = int(node["legacyResourceId"])
+                spellings.setdefault(key, set()).add(sku)
+                if len(spellings[key]) > 1:
+                    sku_map[key] = None  # SKUs that differ only by capitals: never guess
+                else:
+                    sku_map[key] = vid  # exact repeats keep the old behaviour (last one wins)
         if not page["pageInfo"]["hasNextPage"]:
             break
         cursor = page["pageInfo"]["endCursor"]
+    for key, names in spellings.items():
+        if len(names) > 1:
+            print(f"  [!] SKUs {sorted(names)} differ only by capitals in Shopify: orders with them will not be linked.")
     return sku_map
 
 
@@ -790,7 +800,7 @@ def load_sku_weights():
     """Optional sku_weights.json {"SKU": grams}: a fixed weight for a SKU, used before anything else."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sku_weights.json"), encoding="utf-8") as f:
-            return {str(k).strip().lower(): float(v) for k, v in json.load(f).items()}
+            return {str(k).strip().lower(): float(v) for k, v in json.load(f).items() if not str(k).startswith("_")}
     except (OSError, ValueError, AttributeError):
         return {}
 
@@ -855,8 +865,8 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
         }
         if sku:
             item["sku"] = sku
-            if sku in sku_map:
-                item["variant_id"] = sku_map[sku]
+            if sku_map.get(sku.lower()):
+                item["variant_id"] = sku_map[sku.lower()]
         if "variant_id" not in item:
             grams = item_weight_grams(tx, sku)
             if grams > 0:
