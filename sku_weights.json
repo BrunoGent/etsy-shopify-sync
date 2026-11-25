@@ -1,7 +1,12 @@
 {
   "_description": "Weight in grams for items whose SKU is NOT a product in Shopify, so the label popup does not show 0 kg. One line per SKU, SKU on the left (not case sensitive), grams on the right. Items linked to a Shopify product use the product's own weight. Used when an order is imported, so it does not change orders already in Shopify. Keep the commas and quotes exactly as below.",
+
+  
+  "_note_advent": "Advent set is the old (deprecated) SKU and Advent is the current one. Both are kept so old and new orders get a weight.",
   "Advent set": 500,
   "Advent": 500,
+
+  
   "100g BW": 100,
   "226g BW": 226,
   "453g BW": 453,
