@@ -116,6 +116,24 @@ Etsy marks repeat buyers with a star; Shopify cannot, because Etsy hides buyer e
 
 Day to day you only need the two `.bat` shortcuts. Everything else is typed into a terminal.
 
+### All the tools at a glance
+
+Every script in this folder. "Changes anything?" says what it can alter. Every tool that changes Shopify does a **rehearsal by default** (it only shows what it would do); you must add `--apply` to make it act.
+
+| Tool | What it is for | Changes anything? | Safe first step |
+| --- | --- | --- | --- |
+| `run_sync_orders.bat` (menu: Sync) | The daily run: bring in new Etsy orders, put Northern Ireland ones on hold, send tracking | Yes: Shopify, Etsy, `orders.db` | `python sync.py --import-orders --dry-run` |
+| `run_tracking.bat` | Send tracking to Etsy only | Yes: Etsy, `orders.db` | `python sync.py --tracking-only --dry-run` |
+| `Force tracking.bat` | Send tracking now, ignoring ship-by dates | Yes: Etsy | add `--dry-run` |
+| `sync.py` | The program behind those three; every option is listed below | Depends on options | `--dry-run` |
+| `backfill_orders.py` | Download your whole Etsy order history into `orders.db` | Only `orders.db` (reads Etsy) | `--dry-run` |
+| `reports.py` | Sales summary, best sellers, repeat customers, CSV export | No (reads `orders.db`; `--export` writes a file) | none needed |
+| `email_server.py` + `email_capture/` | Saves buyer emails shown on your Etsy Orders pages | Only `orders.db` | `--stats` |
+| `backfill_customer_emails.py` | One-off: add captured emails to Shopify customers of dispatched orders | Yes: Shopify customers | run it with no options |
+| `replace_placeholder_emails.py` | One-off: replace OrderBridge's made-up emails with real captured ones | Yes: Shopify customers | run it with no options |
+| `merge_duplicate_customers.py` | Merge a repeat buyer's duplicate Shopify customers (`--placeholders`: OrderBridge ones) | Yes: Shopify customers, **cannot be undone** | run it with no options |
+| `auth.py` | One-time Etsy sign-in | Only `.env` (tokens) | none |
+
 ### How to type a command
 
 1. Open the folder containing `sync.py` in File Explorer.
@@ -155,6 +173,8 @@ With **no options at all**, `python sync.py` only syncs tracking (Shopify → Et
 | `--force-dispatch` | Marks orders dispatched on Etsy **now**, even if their ship-by date is still in the future. | You posted early and want buyers to get their tracking today. |
 | `--backfill-deadlines` | Re-applies the "Fulfill by" date to Etsy orders that are already in Shopify. Does not import anything new unless `--import-orders` is also given. | The "Fulfill by" column is empty for some orders. |
 | `--limit N` | How many Etsy orders to look at per run. Default 500. | Only if a run says it reached the limit. |
+| `--no-link-customers` | Switches off the default where a repeat Etsy buyer's new order is attached to their existing Shopify customer. Orders then each create a new customer, as before. | Only if linking ever misbehaves. |
+| `--tag-repeats` | Tags orders already in Shopify (not yet dispatched) from repeat Etsy buyers: `Repeat customer`, `Repeat order N`. Add `--dry-run` to preview. It then stops without importing anything. | After a history backfill, or if open orders are missing their repeat tags. |
 
 ### Common combinations
 
@@ -187,6 +207,39 @@ With **no options at all**, `python sync.py` only syncs tracking (Shopify → Et
 | `--months N` | How many months to list. Default 13. |
 | `--top N` | How many products and customers to list. Default 20. |
 | `--export FILE.csv` | Saves every order to a spreadsheet file instead, for example `--export orders.csv`. |
+
+**`email_server.py`** listens for the buyer emails the Chrome extension captures from your Etsy Orders pages (see the email capture section above).
+
+| Option | What it does |
+| --- | --- |
+| *(none)* | Starts the listener and keeps running; close its window or press Ctrl+C to stop. |
+| `--stats` | Shows how many emails are stored, then stops. |
+| `--missing [N]` | Lists the next N (default 25) highest-spending buyers with no email yet, then stops. |
+
+**`backfill_customer_emails.py`** adds captured emails to the Shopify customers of orders that are already dispatched (the daily run only fills open orders).
+
+| Option | What it does |
+| --- | --- |
+| *(none)* | Rehearsal: reads Shopify, prints how many customers would get an email, changes nothing. |
+| `--apply` | Does it. Only customers with no email are filled; customers only (not orders); marketing consent is never touched. |
+| `--limit N` | With `--apply`: stop after N customers (use `--apply --limit 10` as a trial). |
+
+**`replace_placeholder_emails.py`** replaces OrderBridge's made-up customer emails (`etsy-<order number>@placeholder...`) with the real captured email.
+
+| Option | What it does |
+| --- | --- |
+| *(none)* | Rehearsal: counts the placeholders and how many have a real email on file. |
+| `--apply` | Does it. A real email is never replaced, subscribed customers are skipped, consent is never touched. |
+| `--limit N` | With `--apply`: stop after N customers. |
+
+**`merge_duplicate_customers.py`** merges Shopify customer records that belong to the same Etsy buyer. **Merging cannot be undone.** It needs the app permissions `read_customer_merge` and `write_customer_merge`.
+
+| Option | What it does |
+| --- | --- |
+| *(none)* | Rehearsal: lists every safe merge and asks Shopify's own merge preview about each. Changes nothing. |
+| `--apply` | Does the merges. Each is checked afterwards (orders added up, email kept). |
+| `--limit N` | With `--apply`: stop after N merges (`--apply --limit 1` is the trial). |
+| `--placeholders` | Instead of repeat buyers, merge an OrderBridge placeholder customer into the customer that already holds that buyer's real email. |
 
 **`auth.py`** takes no options. It is the one-time Etsy sign-in.
 
