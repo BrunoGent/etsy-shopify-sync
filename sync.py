@@ -365,13 +365,14 @@ def build_shopify_sku_map():
     query = """
     query variants($cursor: String) {
       productVariants(first: 250, after: $cursor) {
-        nodes { sku legacyResourceId }
+        nodes { sku legacyResourceId product { status } }
         pageInfo { hasNextPage endCursor }
       }
     }
     """
     sku_map = {}
     spellings = {}
+    active = {}
     cursor = None
     for _ in range(200):  # up to 50,000 variants
         page = shopify_graphql(query, {"cursor": cursor})["productVariants"]
@@ -383,8 +384,10 @@ def build_shopify_sku_map():
                 spellings.setdefault(key, set()).add(sku)
                 if len(spellings[key]) > 1:
                     sku_map[key] = None  # SKUs that differ only by capitals: never guess
-                else:
-                    sku_map[key] = vid  # exact repeats keep the old behaviour (last one wins)
+                elif not (key in sku_map and active.get(key) and node["product"]["status"] != "ACTIVE"):
+                    # exact repeats: the last one wins, but never let an archived/draft product replace an active one
+                    sku_map[key] = vid
+                    active[key] = node["product"]["status"] == "ACTIVE"
         if not page["pageInfo"]["hasNextPage"]:
             break
         cursor = page["pageInfo"]["endCursor"]
@@ -1197,9 +1200,26 @@ def print_ni_banner():
     print(line)
 
 
+UNWEIGHTED_ITEMS = []  # (receipt, sku, title) imported with no Shopify product and no weight
+
+
+def print_unweighted_items():
+    """Imported items that are not Shopify products and got no weight: the label popup will show 0 kg.
+    Fix by adding the SKU to sku_weights.json."""
+    if not UNWEIGHTED_ITEMS:
+        return
+    print("\n" + paint("[Weights] Items with no Shopify product and no weight (labels will show 0 kg):", "yellow"))
+    for sku in sorted({x[1] for x in UNWEIGHTED_ITEMS}):
+        orders = ", ".join("#" + x[0] for x in UNWEIGHTED_ITEMS if x[1] == sku)
+        title = next(x[2] for x in UNWEIGHTED_ITEMS if x[1] == sku)
+        print(f"  SKU '{sku}' ({title[:45]}) - Etsy {orders}")
+    print("  Add the SKU and its weight in grams to sku_weights.json; the next import will use it.")
+
+
 def import_etsy_orders(args):
     print(f"\n--- Checking Unshipped Orders: Etsy -> Shopify (Dry Run: {args.dry_run}) ---")
     ni_held_orders.clear()
+    UNWEIGHTED_ITEMS.clear()
     # Both lookups raise on failure: importing without them risks duplicates or unlinked items.
     sku_map = build_shopify_sku_map() if args.import_orders else {}
     existing_shopify_map = build_existing_shopify_receipt_map()
@@ -1261,6 +1281,9 @@ def import_etsy_orders(args):
         if hold_ni:
             o_data["tags"] = f"{o_data['tags']}, {NI_TAG}"
         unlinked = [i.get("sku", "no SKU") for i in o_data["line_items"] if "variant_id" not in i]
+        for i in o_data["line_items"]:
+            if "variant_id" not in i and not i.get("grams"):
+                UNWEIGHTED_ITEMS.append((receipt_id, i.get("sku") or "no SKU", i.get("title", "")))
         c_name = f"{o_data['customer']['first_name']} {o_data['customer']['last_name']}"
 
         # A repeat buyer joins their existing Shopify customer instead of getting a duplicate record.
@@ -2018,6 +2041,7 @@ def main(argv=None):
         print_run_summary()
         print_due_orders()
         print_email_coverage()
+        print_unweighted_items()
         report_combinable_orders(dry_run=args.dry_run)
         print_gift_messages()
         print_ni_banner()
