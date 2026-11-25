@@ -2053,12 +2053,26 @@ def sync_channel_orders(dry_run=False, full=False):
     if dry_run:
         print(f"  [DRY RUN] Would store {len(mine)} eBay/web order(s) ({len(orders) - len(mine)} Etsy skipped).")
         return
+    def utc(text):
+        try:
+            return datetime.fromisoformat(str(text).replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            return str(text or "")
+    known = {r[0]: utc(r[1]) for r in _db_query("SELECT shopify_order_id, shopify_updated_at FROM channel_orders")}
+    new, changed = {}, 0
     for o in mine:
+        sid = str(o["id"])
+        if sid in known and known[sid] == utc(o.get("updated_at")):
+            continue  # already stored and unchanged: the one-day overlap re-reads these
+        o["updated_at"] = utc(o.get("updated_at"))
         save_channel_order(o)
-    by_channel = {}
-    for o in mine:
-        by_channel[(o.get("source_name") or "unknown")] = by_channel.get((o.get("source_name") or "unknown"), 0) + 1
-    note("Other-channel orders saved (eBay / web)", [(k, n, None) for k, n in sorted(by_channel.items())])
+        if sid in known:
+            changed += 1
+        else:
+            channel = o.get("source_name") or "unknown"
+            new[channel] = new.get(channel, 0) + 1
+    note("New eBay / web orders saved", [(k, n, None) for k, n in sorted(new.items())])
+    note("eBay / web orders updated", [("Changed since last run", changed, None)])
 
 
 def backup_database():
