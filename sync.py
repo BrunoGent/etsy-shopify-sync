@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import json
 import sys
 import time
 import sqlite3
@@ -781,6 +782,42 @@ def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
         print(f"  [!] Failed to set 'Fulfill by' deadline ({g_resp.status_code}): {g_resp.text}")
 
 
+WEIGHT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|kilo|g|gram|lb|oz)", re.I)
+WEIGHT_UNITS = {"kg": 1000, "kilo": 1000, "g": 1, "gram": 1, "lb": 453.592, "oz": 28.3495}
+
+
+def load_sku_weights():
+    """Optional sku_weights.json {"SKU": grams}: a fixed weight for a SKU, used before anything else."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sku_weights.json"), encoding="utf-8") as f:
+            return {str(k).strip(): float(v) for k, v in json.load(f).items()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def item_weight_grams(tx, sku):
+    """Weight in grams of one unit for an item that is not linked to a Shopify product (those use the
+    product's own weight). Order: sku_weights.json, Etsy's item weight, then an Etsy option such as
+    'Weight: 1 Kg' or '500g'. Returns 0 when unknown."""
+    fixed = load_sku_weights()
+    if sku in fixed:
+        return int(round(fixed[sku]))
+    try:
+        w = float(tx.get("item_weight") or 0)
+    except (TypeError, ValueError):
+        w = 0
+    unit = str(tx.get("item_weight_unit") or "").lower()
+    if w > 0 and unit in WEIGHT_UNITS:
+        return int(round(w * WEIGHT_UNITS[unit]))
+    for var in tx.get("variations", []):
+        text = f"{var.get('formatted_name') or var.get('property_name') or ''} {var.get('formatted_value') or var.get('value') or ''}"
+        if "weight" in text.lower() or "size" in text.lower():
+            m = WEIGHT_RE.search(text.replace("Weight", ""))
+            if m:
+                return int(round(float(m.group(1).replace(",", ".")) * WEIGHT_UNITS[m.group(2).lower()]))
+    return 0
+
+
 def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
     if sku_map is None:
         sku_map = {}
@@ -820,6 +857,10 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
             item["sku"] = sku
             if sku in sku_map:
                 item["variant_id"] = sku_map[sku]
+        if "variant_id" not in item:
+            grams = item_weight_grams(tx, sku)
+            if grams > 0:
+                item["grams"] = grams  # the label popup shows this instead of 0 kg
 
         if properties:
             item["properties"] = properties
