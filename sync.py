@@ -790,7 +790,7 @@ def load_sku_weights():
     """Optional sku_weights.json {"SKU": grams}: a fixed weight for a SKU, used before anything else."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sku_weights.json"), encoding="utf-8") as f:
-            return {str(k).strip(): float(v) for k, v in json.load(f).items()}
+            return {str(k).strip().lower(): float(v) for k, v in json.load(f).items()}
     except (OSError, ValueError, AttributeError):
         return {}
 
@@ -800,8 +800,8 @@ def item_weight_grams(tx, sku):
     product's own weight). Order: sku_weights.json, Etsy's item weight, then an Etsy option such as
     'Weight: 1 Kg' or '500g'. Returns 0 when unknown."""
     fixed = load_sku_weights()
-    if sku in fixed:
-        return int(round(fixed[sku]))
+    if sku.strip().lower() in fixed:  # not case sensitive
+        return int(round(fixed[sku.strip().lower()]))
     try:
         w = float(tx.get("item_weight") or 0)
     except (TypeError, ValueError):
