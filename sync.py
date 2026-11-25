@@ -8,7 +8,7 @@ import sqlite3
 import argparse
 import traceback
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import requests
 from dotenv import load_dotenv, set_key
 
@@ -121,6 +121,25 @@ def init_db():
                 receipt_id TEXT PRIMARY KEY,
                 email TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS channel_orders (
+                shopify_order_id TEXT PRIMARY KEY,
+                order_name TEXT, channel TEXT, channel_tags TEXT, order_date TEXT,
+                financial_status TEXT, fulfillment_status TEXT, cancelled INTEGER DEFAULT 0,
+                buyer_name TEXT, buyer_email TEXT, buyer_phone TEXT,
+                address1 TEXT, address2 TEXT, city TEXT, province TEXT, postcode TEXT, country TEXT,
+                items TEXT, item_count INTEGER, items_total REAL, shipping_cost REAL, discount REAL,
+                tax REAL, grand_total REAL, refunded REAL, currency TEXT, shipping_title TEXT,
+                tracking TEXT, shipped_date TEXT, shopify_updated_at TEXT, saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS channel_order_items (
+                shopify_order_id TEXT, line_id TEXT, sku TEXT, title TEXT, variant_title TEXT,
+                quantity INTEGER, unit_price REAL, discount REAL, grams INTEGER,
+                PRIMARY KEY (shopify_order_id, line_id)
             )
         """)
         cursor.execute("PRAGMA table_info(synced_orders)")
@@ -1960,6 +1979,88 @@ def print_gift_messages():
     print(line)
 
 
+CHANNEL_FIRST_RUN_DAYS = 60  # Shopify only returns the last 60 days without the read_all_orders scope
+
+
+def is_channel_order(order):
+    """eBay / web-store / other orders: everything except the Etsy orders this sync imported."""
+    tags = [t.strip().lower() for t in str(order.get("tags") or "").split(",")]
+    if "etsy" in tags or extract_etsy_receipt_id(order):
+        return False
+    return True
+
+
+def save_channel_order(order):
+    """Stores one non-Etsy Shopify order (and its items) in orders.db for costing/analysis."""
+    def money(x):
+        try:
+            return float(x or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    ship = order.get("shipping_address") or {}
+    cust = order.get("customer") or {}
+    lines = order.get("line_items") or []
+    refunded = sum(money(t.get("amount")) for r in order.get("refunds") or []
+                   for t in r.get("transactions") or [] if t.get("kind") == "refund")
+    fulfils = [f for f in order.get("fulfillments") or [] if f.get("status") != "cancelled"]
+    tracking = ", ".join(sorted({n for f in fulfils for n in (f.get("tracking_numbers") or []) if n}))
+    shipped = min((f.get("created_at") or "" for f in fulfils), default="")[:10]
+    tags = str(order.get("tags") or "")
+    channel = (order.get("source_name") or "unknown").lower()
+    sid = str(order["id"])
+    readable = "\n".join(
+        f"{li.get('quantity', 1)}x {li.get('title', '')}" + (f" [{li['sku']}]" if li.get("sku") else "")
+        for li in lines)
+    name = (ship.get("name") or f"{cust.get('first_name') or ''} {cust.get('last_name') or ''}").strip()
+    shipping_line = (order.get("shipping_lines") or [{}])[0]
+    values = (
+        sid, order.get("name"), channel, tags, (order.get("created_at") or "")[:19],
+        order.get("financial_status"), order.get("fulfillment_status"), 1 if order.get("cancelled_at") else 0,
+        name, order.get("email") or cust.get("email") or "", order.get("phone") or ship.get("phone") or "",
+        ship.get("address1"), ship.get("address2"), ship.get("city"), ship.get("province"),
+        ship.get("zip"), ship.get("country_code"),
+        readable, sum(int(li.get("quantity") or 0) for li in lines), money(order.get("current_subtotal_price") or order.get("subtotal_price")),
+        sum(money(sl.get("price")) for sl in order.get("shipping_lines") or []),
+        money(order.get("total_discounts")), money(order.get("total_tax")), money(order.get("total_price")),
+        refunded, order.get("currency"), shipping_line.get("title"), tracking, shipped, order.get("updated_at"))
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("INSERT OR REPLACE INTO channel_orders (shopify_order_id, order_name, channel, channel_tags, order_date, "
+                     "financial_status, fulfillment_status, cancelled, buyer_name, buyer_email, buyer_phone, address1, address2, "
+                     "city, province, postcode, country, items, item_count, items_total, shipping_cost, discount, tax, "
+                     "grand_total, refunded, currency, shipping_title, tracking, shipped_date, shopify_updated_at) "
+                     "VALUES (" + ",".join("?" * 30) + ")", values)
+        conn.execute("DELETE FROM channel_order_items WHERE shopify_order_id = ?", (sid,))
+        for li in lines:
+            discount = sum(money(d.get("amount")) for d in li.get("discount_allocations") or [])
+            conn.execute("INSERT INTO channel_order_items VALUES (?,?,?,?,?,?,?,?,?)",
+                         (sid, str(li.get("id")), li.get("sku") or "", li.get("title"), li.get("variant_title"),
+                          li.get("quantity"), money(li.get("price")), discount, li.get("grams")))
+        conn.commit()
+
+
+def sync_channel_orders(dry_run=False, full=False):
+    """Copies every non-Etsy Shopify order (eBay, web store, ...) into orders.db. Read-only on Shopify.
+    Incremental: only orders changed since the last stored update (minus a day). Without the
+    read_all_orders scope Shopify returns at most the last 60 days."""
+    latest = _db_query("SELECT MAX(shopify_updated_at) FROM channel_orders")[0][0]
+    if latest and not full:
+        since = (datetime.fromisoformat(latest.replace("Z", "+00:00")) - timedelta(days=1)).isoformat()
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(days=CHANNEL_FIRST_RUN_DAYS)).isoformat()
+    url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+    orders = shopify_get_all(url, {"status": "any", "limit": 250, "updated_at_min": since}, "orders", 20000)
+    mine = [o for o in orders if is_channel_order(o)]
+    if dry_run:
+        print(f"  [DRY RUN] Would store {len(mine)} eBay/web order(s) ({len(orders) - len(mine)} Etsy skipped).")
+        return
+    for o in mine:
+        save_channel_order(o)
+    by_channel = {}
+    for o in mine:
+        by_channel[(o.get("source_name") or "unknown")] = by_channel.get((o.get("source_name") or "unknown"), 0) + 1
+    note("Other-channel orders saved (eBay / web)", [(k, n, None) for k, n in sorted(by_channel.items())])
+
+
 def backup_database():
     """Copies orders.db into BACKUP_DIR as orders-YYYY-MM-DD.db and keeps the newest BACKUP_KEEP.
     Never raises: a failed backup must not look like a failed sync."""
@@ -2000,6 +2101,8 @@ def main(argv=None):
                         help="Do not attach a repeat Etsy buyer's new order to their existing Shopify customer (new orders then each create a new customer, as before).")
     parser.add_argument("--tag-repeats", action="store_true",
                         help="Tag already-imported, not-yet-dispatched orders from repeat Etsy buyers (Repeat customer, Repeat order N), then exit.")
+    parser.add_argument("--channel-full", action="store_true",
+                        help="Re-read every eBay/web order Shopify will return (last 60 days) instead of only recent changes.")
     args = parser.parse_args(argv)
 
     console = sys.stdout
@@ -2017,6 +2120,7 @@ def main(argv=None):
         sync_etsy_dispatch_to_shopify(dry_run=args.dry_run)
         sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch)
         fill_missing_shopify_emails(dry_run=args.dry_run)
+        sync_channel_orders(dry_run=args.dry_run, full=args.channel_full)
         if not args.dry_run:
             backup_database()
         print("\n--- Sync Complete ---")
