@@ -74,6 +74,7 @@ Emails land in `etsy_emails` (per order, which the sync already reads) and `buye
 ### 5. Housekeeping on every run
 
 - **Due list:** orders due today or overdue that are still not dispatched on Etsy.
+- **Buyer emails:** one line saying how many of the current orders (imported, not yet dispatched) have a buyer email saved, listing any without one (see the optional email capture below).
 - **Gift messages:** at the very end, a box lists imported orders with a gift message that are not yet dispatched, as a reminder to print the gift message from Etsy.
 - **Run log:** everything printed is also saved to `logs/YYYY-MM-DD.log` (kept for 90 days).
 - **Backup:** `orders.db` is copied to a `backups` folder as `orders-YYYY-MM-DD.db` and the newest 30 are kept. You can point this at a cloud folder instead (see [Backups](#backups)).

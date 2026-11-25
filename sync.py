@@ -1614,6 +1614,32 @@ def print_due_orders():
         print(f"  [{when}] Etsy #{receipt_id}{' - ' + name if name else ''}")
 
 
+def print_email_coverage():
+    """One line: how many of the current (imported, not yet dispatched) orders have a buyer email saved.
+    Emails come from the optional capture extension (email_server.py). Read-only."""
+    today = date.today().isoformat()
+    try:
+        have_buyer = {str(r[0]) for r in _db_query("SELECT buyer_id FROM buyer_emails WHERE email <> ''")}
+    except sqlite3.Error:
+        have_buyer = set()  # listener never run: table does not exist yet
+    have_receipt = {str(r[0]) for r in _db_query("SELECT receipt_id FROM etsy_emails WHERE email <> ''")}
+    rows = _db_query("""
+        SELECT etsy_receipt_id, buyer_user_id, buyer_name, buyer_email FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+          AND (order_date IS NULL OR order_date >= date(?, '-21 days'))
+    """, (today,))
+    if not rows:
+        return
+    without = [r for r in rows
+               if not (str(r[0]) in have_receipt or (r[1] and str(r[1]) in have_buyer) or (r[3] or "").strip())]
+    print(f"\n[Buyer emails] {len(rows) - len(without)} of {len(rows)} current orders have an email saved"
+          + (" (capture the rest from Etsy Orders: Beemine Start > 8)." if without else "."))
+    for receipt_id, _uid, name, _mail in without[:10]:
+        print(f"  no email: Etsy #{receipt_id}{' - ' + name if name else ''}")
+    if len(without) > 10:
+        print(f"  ... and {len(without) - 10} more")
+
+
 def print_gift_messages():
     """Lists imported orders that carry a gift message and are not yet dispatched, as a reminder to
     print the gift message from Etsy (Etsy generates that A4 page; this program cannot)."""
@@ -1694,6 +1720,7 @@ def main(argv=None):
         sync_etsy_dispatch_to_shopify(dry_run=args.dry_run)
         sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch)
         print_due_orders()
+        print_email_coverage()
         if not args.dry_run:
             backup_database()
         print("\n--- Sync Complete ---")
