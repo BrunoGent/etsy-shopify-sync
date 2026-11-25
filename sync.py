@@ -1714,6 +1714,8 @@ def fill_missing_shopify_emails(dry_run=False):
                 json={"customer": {"id": customer["id"], "email": email}})
             if cresp.status_code not in (200, 201):
                 shared += 1  # the email already belongs to another customer record: leave customers alone
+                print(f"  [i] Etsy #{rid}: that email already belongs to another Shopify customer, so the order has the email "
+                      f"but is not linked to that customer. Merge the two customers in Shopify if you want them joined.")
         oresp = shopify_request("PUT", url, json={"order": {"id": sid, "email": email}})
         if oresp.status_code != 200:
             failed += 1
