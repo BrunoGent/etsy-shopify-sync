@@ -1674,6 +1674,58 @@ def print_email_coverage():
         print(f"  ... and {len(without) - 10} more")
 
 
+def fill_missing_shopify_emails(dry_run=False):
+    """Open orders imported before the buyer's email was captured: put the captured email on the Shopify
+    order and its customer. Only fills a blank (never overwrites), and never touches marketing consent:
+    a customer who subscribes on the store stays subscribed."""
+    try:
+        by_buyer = {str(r[0]): r[1] for r in _db_query("SELECT buyer_id, email FROM buyer_emails WHERE email <> ''")}
+    except sqlite3.Error:
+        by_buyer = {}
+    by_receipt = {str(r[0]): r[1] for r in _db_query("SELECT receipt_id, email FROM etsy_emails WHERE email <> ''")}
+    rows = _db_query("""
+        SELECT etsy_receipt_id, shopify_order_id, buyer_user_id FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+          AND COALESCE(buyer_email, '') = ''""")
+    added = failed = shared = 0
+    for rid, shopify_id, uid in rows:
+        email = (by_receipt.get(str(rid)) or by_buyer.get(str(uid)) or "").strip()
+        sid = _numeric_id(shopify_id)
+        if not email or not sid:
+            continue
+        url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders/{sid}.json"
+        resp = shopify_request("GET", url, params={"fields": "id,email,customer"})
+        if resp.status_code != 200:
+            failed += 1
+            print(f"  [!] Could not read Shopify order for Etsy #{rid} ({resp.status_code}).")
+            continue
+        order = resp.json().get("order", {})
+        if (order.get("email") or "").strip():
+            if not dry_run:
+                _db_execute("UPDATE synced_orders SET buyer_email = ? WHERE etsy_receipt_id = ?", (email, str(rid)))
+            continue
+        if dry_run:
+            print(f"  [DRY RUN] Would add the email to Shopify order for Etsy #{rid}.")
+            continue
+        customer = order.get("customer") or {}
+        if customer.get("id") and not (customer.get("email") or "").strip():
+            cresp = shopify_request(
+                "PUT", f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/customers/{customer['id']}.json",
+                json={"customer": {"id": customer["id"], "email": email}})
+            if cresp.status_code not in (200, 201):
+                shared += 1  # the email already belongs to another customer record: leave customers alone
+        oresp = shopify_request("PUT", url, json={"order": {"id": sid, "email": email}})
+        if oresp.status_code != 200:
+            failed += 1
+            print(f"  [!] Could not add the email to Etsy #{rid} ({oresp.status_code}): {oresp.text[:200]}")
+            continue
+        _db_execute("UPDATE synced_orders SET buyer_email = ? WHERE etsy_receipt_id = ?", (email, str(rid)))
+        added += 1
+    note("Buyer emails added to open Shopify orders", [
+        ("Added", added, None), ("Email already on another customer (not linked)", shared, "yellow"),
+        ("Failed", failed, "red")])
+
+
 def find_combinable_orders():
     """Groups of open (imported, not yet dispatched) orders from the same buyer going to the same address.
     Returns a list of groups; each group is a list of (receipt_id, shopify_order_id, name, items)."""
@@ -1801,6 +1853,7 @@ def main(argv=None):
 
         sync_etsy_dispatch_to_shopify(dry_run=args.dry_run)
         sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch)
+        fill_missing_shopify_emails(dry_run=args.dry_run)
         if not args.dry_run:
             backup_database()
         print("\n--- Sync Complete ---")
