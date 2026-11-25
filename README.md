@@ -284,6 +284,7 @@ Postage upgrades are detected from the name of the Etsy shipping upgrade the buy
 | `sync.py` | The sync itself: import, tracking, housekeeping |
 | `backfill_orders.py` | Downloads past Etsy orders into the database |
 | `backfill_customer_emails.py` | One-off: adds captured buyer emails to the Shopify customers of already-dispatched orders (rehearsal by default; `--apply`, `--limit N`) |
+| `merge_duplicate_customers.py` | Merges Shopify customer records of the same Etsy buyer (same buyer id, surname and postcode) into the record that holds the email. Rehearsal by default; `--apply`, `--limit N`. Needs the app permissions `read_customer_merge` and `write_customer_merge`; merging cannot be undone |
 | `reports.py` | Reports and CSV export |
 | `email_server.py`, `email_capture/` (own README) | Optional: local listener and Chrome extension that save buyer emails shown on your Etsy Orders pages |
 | `auth.py` | One-time Etsy sign-in |
