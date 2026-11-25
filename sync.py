@@ -1200,10 +1200,10 @@ def import_etsy_orders(args):
                 print("  [!!!] COULD NOT PUT THIS ORDER ON HOLD. Do not buy a label for it in Shopify; dispatch it on Etsy.")
                 ni_held_orders.append(ni_entry(receipt, "hold_failed"))
 
-    print(f"\nOrder Import Summary -> Created: {created_count} | Backfilled: {backfilled_count} | "
-          f"Skipped (Existing): {skipped_existing} | Failed: {failed_import} | "
-          f"Cancelled after import: {cancelled_after_import}"
-          + (f" | Northern Ireland on hold: {len(ni_held_orders)}" if args.exclude_ni else ""))
+    note("Orders in (Etsy -> Shopify)", [
+        ("Created", created_count, None), ("Backfilled", backfilled_count, None),
+        ("Failed", failed_import, "red"), ("Cancelled after import", cancelled_after_import, "yellow"),
+        ("Northern Ireland on hold", len(ni_held_orders) if args.exclude_ni else 0, "yellow")])
 
 
 # =====================================================================
@@ -1416,8 +1416,9 @@ def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False):
         for due, receipt_id in sorted(held):
             print(f"    - Etsy #{receipt_id}: dispatch on {due.strftime('%a %d %b %Y')}")
 
-    print(f"Tracking Sync Summary -> Dispatched: {dispatched} | Held until ship-by date: {len(held)} | "
-          f"Skipped (DB): {skipped_db} | Skipped (Etsy): {skipped_etsy} | Failed: {failed}")
+    note("Tracking (Shopify -> Etsy)", [
+        ("Dispatched", dispatched, None), ("Held until ship-by date", len(held), "yellow"),
+        ("Failed", failed, "red")])
 
 
 # =====================================================================
@@ -1501,7 +1502,6 @@ def sync_etsy_dispatch_to_shopify(dry_run=False):
     """)
     fulfilled, already, failed = 0, 0, 0
     if not rows:
-        print("Etsy Dispatch Summary -> Nothing waiting.")
         return
 
     recent, oldest = fetch_recent_shipped_receipts()
@@ -1556,13 +1556,44 @@ def sync_etsy_dispatch_to_shopify(dry_run=False):
             print(f"  [!] Failed #{receipt_id}: {e}")
             failed += 1
 
-    print(f"Etsy Dispatch Summary -> Marked fulfilled in Shopify: {fulfilled} | "
-          f"Already fulfilled: {already} | Failed: {failed}")
+    note("Dispatched on Etsy (-> Shopify)", [
+        ("Marked fulfilled in Shopify", fulfilled, None), ("Already fulfilled", already, None),
+        ("Failed", failed, "red")])
 
 
 # =====================================================================
 # HOUSEKEEPING: RUN LOG, DUE LIST, BACKUP
 # =====================================================================
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+COLOURS = {"red": "91", "yellow": "93", "green": "92"}
+RUN_SUMMARY = []  # (section, [(label, count, colour)]) collected during the run, printed once at the end
+
+
+def paint(text, colour):
+    """Colours text on the console only; the run log has the codes stripped out again."""
+    if colour not in COLOURS or not sys.__stdout__.isatty():
+        return text
+    return f"\x1b[{COLOURS[colour]}m{text}\x1b[0m"
+
+
+def note(section, counts):
+    """Records a step's counts for the end-of-run report."""
+    RUN_SUMMARY.append((section, counts))
+
+
+def print_run_summary():
+    """One block: only counts that are not zero. Zero warnings are left out; non-zero ones are coloured."""
+    lines = []
+    for section, counts in RUN_SUMMARY:
+        shown = [(l, n, c) for l, n, c in counts if n]
+        if shown:
+            parts = [paint(f"{l}: {n}", c) if c else f"{l}: {n}" for l, n, c in shown]
+            lines.append(f"  {section}: " + " | ".join(parts))
+    RUN_SUMMARY.clear()
+    print("\nRESULT")
+    print("\n".join(lines) if lines else "  Nothing new: no orders created, dispatched or needing attention.")
+
 
 class _Tee:
     """Sends everything printed to both the console and the run log."""
@@ -1576,7 +1607,7 @@ class _Tee:
         except UnicodeEncodeError:
             enc = getattr(self.console, "encoding", None) or "ascii"
             self.console.write(data.encode(enc, "replace").decode(enc))
-        self.logfile.write(data)
+        self.logfile.write(ANSI_RE.sub("", data))
 
     def flush(self):
         self.console.flush()
@@ -1593,6 +1624,7 @@ def start_run_log(argv):
             os.remove(path)
     logfile = open(os.path.join(LOG_DIR, f"{date.today().isoformat()}.log"), "a", encoding="utf-8")
     logfile.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} | sync.py {' '.join(argv) or '(tracking only)'} =====\n")
+    os.system("")  # lets the Windows console show colours
     sys.stdout = _Tee(sys.stdout, logfile)
     return logfile
 
@@ -1608,7 +1640,7 @@ def print_due_orders():
     """, (today, today))
     if not rows:
         return
-    print(f"\n--- {len(rows)} order(s) due today or overdue, not yet dispatched on Etsy ---")
+    print(paint(f"\n--- {len(rows)} order(s) due today or overdue, not yet dispatched on Etsy ---", "yellow"))
     for receipt_id, ship_by, name in rows:
         when = "DUE TODAY" if ship_by == today else f"OVERDUE since {ship_by}"
         print(f"  [{when}] Etsy #{receipt_id}{' - ' + name if name else ''}")
@@ -1632,8 +1664,9 @@ def print_email_coverage():
         return
     without = [r for r in rows
                if not (str(r[0]) in have_receipt or (r[1] and str(r[1]) in have_buyer) or (r[3] or "").strip())]
-    print(f"\n[Buyer emails] {len(rows) - len(without)} of {len(rows)} current orders have an email saved"
-          + (" (capture the rest from Etsy Orders: Beemine Start > 8)." if without else "."))
+    text = (f"[Buyer emails] {len(rows) - len(without)} of {len(rows)} current orders have an email saved"
+            + (" (capture the rest from Etsy Orders: Beemine Start > 8)." if without else "."))
+    print("\n" + paint(text, "yellow" if without else "green"))
     for receipt_id, _uid, name, _mail in without[:10]:
         print(f"  no email: Etsy #{receipt_id}{' - ' + name if name else ''}")
     if len(without) > 10:
@@ -1719,11 +1752,13 @@ def main(argv=None):
 
         sync_etsy_dispatch_to_shopify(dry_run=args.dry_run)
         sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch)
-        print_due_orders()
-        print_email_coverage()
         if not args.dry_run:
             backup_database()
         print("\n--- Sync Complete ---")
+        # Every report together at the very end.
+        print_run_summary()
+        print_due_orders()
+        print_email_coverage()
         print_gift_messages()
         print_ni_banner()
     except Exception:

@@ -25,6 +25,8 @@ Etsy's API hides buyer emails, but your own Orders page in Shop Manager shows th
 
 If nothing is captured, press F12 -> Console on the Etsy tab and look for `[BeeMine email capture]`. A "not saved" warning means the listener is not running; the page retries by itself. An "extension was reloaded" warning means press F5.
 
+- **Inactive emails:** when Etsy shows "Inactive email" for a buyer (deleted account, no usable address), the extension records that order in `inactive_emails`, and `--missing` skips those customers so the list only shows people you can still get an email for.
+
 ## What is stored
 - `etsy_emails (receipt_id, email)`: per order. `sync.py` reads this when it imports an order.
 - `buyer_emails (buyer_id, email, buyer_name)`: per Etsy buyer, for linking repeat customers.

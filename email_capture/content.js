@@ -14,25 +14,42 @@
     return null;
   }
 
+  function describe(row) {
+    const orderLink = row.querySelector('a[href*="order_id="]');
+    const order = orderLink && /order_id=(\d+)/.exec(orderLink.getAttribute("href"));
+    if (!order) return null;
+    const buyerLink = row.querySelector('a[href*="buyer_id="]');
+    const buyer = buyerLink && /buyer_id=(\d+)/.exec(buyerLink.getAttribute("href"));
+    const nameEl = row.querySelector("[data-dropdown-button]");
+    return {
+      order_id: order[1],
+      buyer_id: buyer ? buyer[1] : "",
+      name: nameEl ? nameEl.textContent.trim() : "",
+    };
+  }
+
   function scan() {
     const found = [];
+    // Orders that show an email.
     document.querySelectorAll('a[href^="mailto:"]').forEach((mail) => {
       const row = rowFor(mail);
-      if (!row) return;
+      const info = row && describe(row);
+      if (!info) return;
       const email = decodeURIComponent(mail.getAttribute("href").slice(7)).split("?")[0].trim();
-      const order = /order_id=(\d+)/.exec(row.querySelector('a[href*="order_id="]').getAttribute("href"));
-      const buyerLink = row.querySelector('a[href*="buyer_id="]');
-      const buyer = buyerLink && /buyer_id=(\d+)/.exec(buyerLink.getAttribute("href"));
-      const nameEl = row.querySelector("[data-dropdown-button]");
-      const key = order[1] + "|" + email;
+      const key = info.order_id + "|" + email;
       if (!email || sent.has(key)) return;
-      found.push({
-        key: key,
-        order_id: order[1],
-        buyer_id: buyer ? buyer[1] : "",
-        email: email,
-        name: nameEl ? nameEl.textContent.trim() : "",
-      });
+      found.push(Object.assign({ key: key, email: email }, info));
+    });
+    // Orders where Etsy says "Inactive email" (deleted accounts, no usable address): remember them so
+    // they stop showing up as missing.
+    document.querySelectorAll(".fs-exclude").forEach((el) => {
+      if (el.textContent.trim() !== "Inactive email") return;
+      const row = rowFor(el);
+      const info = row && describe(row);
+      if (!info) return;
+      const key = info.order_id + "|inactive";
+      if (sent.has(key)) return;
+      found.push(Object.assign({ key: key, email: "", inactive: true }, info));
     });
     if (!found.length) return;
     try {

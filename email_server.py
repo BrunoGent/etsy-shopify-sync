@@ -36,6 +36,14 @@ def init_tables():
                 buyer_name TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        # Orders/buyers where Etsy shows "Inactive email": there is nothing to capture.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS inactive_emails (
+                receipt_id TEXT PRIMARY KEY,
+                buyer_id TEXT,
+                buyer_name TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
         conn.commit()
 
 
@@ -51,11 +59,19 @@ def store(items):
         for item in items:
             if not isinstance(item, dict):
                 continue
+            order_id, buyer_id = clean_id(item.get("order_id")), clean_id(item.get("buyer_id"))
+            name = str(item.get("name") or "").strip()[:200]
+            if item.get("inactive") is True:
+                if order_id:
+                    conn.execute(
+                        "INSERT INTO inactive_emails (receipt_id, buyer_id, buyer_name) VALUES (?, ?, ?) "
+                        "ON CONFLICT(receipt_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP",
+                        (order_id, buyer_id, name))
+                    saved += 1
+                continue
             email = str(item.get("email") or "").strip().lower()
             if not EMAIL_RE.match(email) or len(email) > 254:
                 continue
-            order_id, buyer_id = clean_id(item.get("order_id")), clean_id(item.get("buyer_id"))
-            name = str(item.get("name") or "").strip()[:200]
             if order_id:
                 conn.execute(
                     "INSERT INTO etsy_emails (receipt_id, email) VALUES (?, ?) "
@@ -126,6 +142,8 @@ def missing(limit):
     with closing(sqlite3.connect(sync.DB_PATH)) as conn:
         have_buyer = {r[0] for r in conn.execute("SELECT buyer_id FROM buyer_emails WHERE email <> ''")}
         have_receipt = {r[0] for r in conn.execute("SELECT receipt_id FROM etsy_emails WHERE email <> ''")}
+        dead_receipts = {r[0] for r in conn.execute("SELECT receipt_id FROM inactive_emails")}
+        dead_buyers = {r[0] for r in conn.execute("SELECT buyer_id FROM inactive_emails WHERE buyer_id <> ''")}
         rows = conn.execute(
             "SELECT etsy_receipt_id, buyer_user_id, buyer_name, postcode, grand_total, order_date FROM synced_orders "
             f"WHERE {SOLD} AND buyer_name IS NOT NULL").fetchall()
@@ -133,19 +151,24 @@ def missing(limit):
         uid = str(uid) if uid else ""
         person = (name.strip().lower(), (postcode or "").replace(" ", "").upper())
         key = uid or person
-        g = groups.setdefault(key, {"person": person, "n": 0, "spent": 0.0, "name": name.strip(), "uid": uid, "last": "", "email": False})
+        g = groups.setdefault(key, {"person": person, "n": 0, "spent": 0.0, "name": name.strip(), "uid": uid, "last": "", "email": False, "inactive": False})
         g["n"] += 1
         g["spent"] += total or 0
         g["last"] = max(g["last"], (order_date or "")[:10])
+        if uid in dead_buyers or str(receipt) in dead_receipts:
+            g["inactive"] = True
         if uid in have_buyer or str(receipt) in have_receipt:
             g["email"] = True
             person_has_email.add(person)  # same name and postcode on another Etsy account counts too
     ranked = sorted((g for g in groups.values() if g["name"].lower() != "me"), key=lambda g: -g["spent"])
     for g in ranked:
         g["email"] = g["email"] or g["person"] in person_has_email
+    inactive = sum(1 for g in ranked if g["inactive"] and not g["email"])
+    ranked = [g for g in ranked if not (g["inactive"] and not g["email"])]
     done = sum(1 for g in ranked if g["email"])
     todo = [g for g in ranked if not g["email"]][:limit]
-    print(f"{done} customers already have an email. Next {len(todo)} by spend without one:")
+    print(f"{done} customers already have an email; {inactive} have an inactive email on Etsy (skipped). "
+          f"Next {len(todo)} by spend without one:")
     print("Search each name in Etsy Orders (set to All) with the extension on and email_server.py running:")
     print(f"{'Spent':>10}{'Orders':>7}  {'Last order':<11}{'Etsy buyer id':<14}Name")
     for g in todo:

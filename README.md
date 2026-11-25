@@ -74,6 +74,7 @@ Emails land in `etsy_emails` (per order, which the sync already reads) and `buye
 ### 5. Housekeeping on every run
 
 - **Due list:** orders due today or overdue that are still not dispatched on Etsy.
+- **Report order:** all reports come together at the very end of the run (RESULT, due list, buyer emails, gift messages, Northern Ireland). RESULT lists only counts that are not zero; warnings (failed, cancelled after import, held, NI on hold) appear in colour and only when there is something to see.
 - **Buyer emails:** one line saying how many of the current orders (imported, not yet dispatched) have a buyer email saved, listing any without one (see the optional email capture below).
 - **Gift messages:** at the very end, a box lists imported orders with a gift message that are not yet dispatched, as a reminder to print the gift message from Etsy.
 - **Run log:** everything printed is also saved to `logs/YYYY-MM-DD.log` (kept for 90 days).
