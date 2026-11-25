@@ -65,6 +65,16 @@ def customers_of(order_ids):
     return found
 
 
+def email_on_other_customer(email, customer_numeric_id):
+    """True when another Shopify customer already holds this email (Shopify then refuses it on a second record)."""
+    data = sync.shopify_graphql(
+        "query($q: String!) { customers(first: 3, query: $q) { nodes { id defaultEmailAddress { emailAddress } } } }",
+        {"q": f"email:{email}"})
+    mine = f"gid://shopify/Customer/{customer_numeric_id}"
+    return any(n["id"] != mine and ((n.get("defaultEmailAddress") or {}).get("emailAddress") or "").lower() == email.lower()
+               for n in data["customers"]["nodes"])
+
+
 def main():
     ap = argparse.ArgumentParser(description="Add captured buyer emails to Shopify customers of dispatched orders.")
     ap.add_argument("--apply", action="store_true", help="really change Shopify (default: rehearsal, changes nothing)")
@@ -101,6 +111,9 @@ def main():
             continue
         counts["to_fill"] += 1
         if not args.apply:
+            if email_on_other_customer(email, cid):          # the real run would be refused by Shopify: say so now
+                counts["to_fill"] -= 1
+                counts["shared"] += 1
             continue
         if args.limit is not None and counts["filled"] >= args.limit:
             break
@@ -138,6 +151,7 @@ def main():
                 json.dump({"changed": changed, "shared_receipts": shared_receipts}, f, indent=1)
             print(f"Written: {path}")
     else:
+        print(f"Email already on another customer (would be left alone): {counts['shared']}")
         print(f"REHEARSAL: {counts['to_fill']} customers would be given an email. Nothing was changed. Add --apply to do it.")
 
 
