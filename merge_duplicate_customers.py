@@ -103,6 +103,67 @@ def plan_merges(groups):
     return plans, skipped
 
 
+REC_FIELDS = "id displayName lastName createdAt numberOfOrders defaultEmailAddress { emailAddress } defaultAddress { zip }"
+
+
+def to_record(c):
+    email = ((c.get("defaultEmailAddress") or {}).get("emailAddress") or "").strip().lower()
+    return {"id": c["id"], "name": c.get("displayName") or "", "last": (c.get("lastName") or "").strip().lower(),
+            "created": c.get("createdAt") or "", "orders": int(c.get("numberOfOrders") or 0), "email": email,
+            "zip": norm_zip((c.get("defaultAddress") or {}).get("zip"))}
+
+
+def plan_placeholder_merges():
+    """OrderBridge placeholder customers (etsy-<order>@placeholder...) whose real, captured email already sits on
+    ANOTHER customer: merge the placeholder record into that one. Same safeguards as plan_merges (same surname and
+    postcode). -> (plans, skipped) in the same shape as plan_merges."""
+    import replace_placeholder_emails as rp
+    try:
+        by_buyer = {str(r[0]): r[1] for r in sync._db_query("SELECT buyer_id, email FROM buyer_emails WHERE email <> ''")}
+    except Exception:
+        by_buyer = {}
+    by_receipt = {str(r[0]): r[1] for r in sync._db_query("SELECT receipt_id, email FROM etsy_emails WHERE email <> ''")}
+
+    placeholders = []
+    for c in rp.all_customers():
+        mt = rp.PLACEHOLDER_RE.match(((c.get("defaultEmailAddress") or {}).get("emailAddress") or "").strip().lower())
+        if mt:
+            placeholders.append((c["id"], mt.group(1)))
+    recs = {}
+    ids = [p[0] for p in placeholders]
+    for i in range(0, len(ids), BATCH):
+        data = sync.shopify_graphql("query($ids: [ID!]!) { nodes(ids: $ids) { ... on Customer { %s } } }" % REC_FIELDS,
+                                    {"ids": ids[i:i + BATCH]})
+        for n in data["nodes"]:
+            if n:
+                recs[n["id"]] = to_record(n)
+        time.sleep(0.2)
+
+    holders_of, by_keeper, skipped = {}, collections.OrderedDict(), []
+    for pid, receipt in placeholders:
+        real = rp.real_email_for(receipt, by_receipt, by_buyer)
+        p = recs.get(pid)
+        if not real or not p:
+            continue                                     # no captured email: nothing to merge with
+        key = real.lower()
+        if key not in holders_of:
+            nodes = sync.shopify_graphql("query($q: String!) { customers(first: 5, query: $q) { nodes { %s } } }" % REC_FIELDS,
+                                         {"q": f"email:{real}"})["customers"]["nodes"]
+            holders_of[key] = [to_record(n) for n in nodes if to_record(n)["email"] == key]
+            time.sleep(0.2)
+        holders = [h for h in holders_of[key] if h["id"] != pid]
+        if not holders:
+            continue                                     # the real email is on no other customer: replace_placeholder_emails.py
+        keep = sorted(holders, key=lambda h: h["created"])[0]
+        if not p["last"] or p["last"] != keep["last"]:
+            skipped.append((receipt, "different surnames", [keep, p]))
+        elif not p["zip"] or p["zip"] != keep["zip"]:
+            skipped.append((receipt, "different or missing postcodes", [keep, p]))
+        else:
+            by_keeper.setdefault(keep["id"], {"buyer": receipt, "keep": keep, "merge": []})["merge"].append(p)
+    return list(by_keeper.values()), skipped
+
+
 def short(gid):
     return gid.rsplit("/", 1)[1]
 
@@ -132,16 +193,24 @@ def main():
     ap = argparse.ArgumentParser(description="Merge Shopify customer records of the same Etsy buyer.")
     ap.add_argument("--apply", action="store_true", help="really merge (default: rehearsal)")
     ap.add_argument("--limit", type=int, default=None, help="stop after merging this many duplicate records")
+    ap.add_argument("--placeholders", action="store_true",
+                    help="instead: merge OrderBridge placeholder customers into the customer that already holds their real email")
     args = ap.parse_args()
 
     sync.init_db()
-    print("Reading customers of every imported order from Shopify...")
-    groups = read_records()
-    plans, skipped = plan_merges(groups)
-    repeat = sum(1 for g in groups.values() if len(g) >= 1)
-    n_dups = sum(len(p["merge"]) for p in plans)
-    print(f"{len(groups)} Etsy buyers; {len(plans) + len(skipped)} are split across several customer records.")
-    print(f"Can be merged safely: {len(plans)} buyers ({n_dups} duplicate records). Left for you to check by hand: {len(skipped)}.\n")
+    if args.placeholders:
+        print("Looking for OrderBridge placeholder customers whose real email already sits on another customer...")
+        plans, skipped = plan_placeholder_merges()
+        n_dups = sum(len(p["merge"]) for p in plans)
+        print(f"Can be merged safely: {len(plans)} customers keep ({n_dups} placeholder records merged in). "
+              f"Left for you to check by hand: {len(skipped)}.\n")
+    else:
+        print("Reading customers of every imported order from Shopify...")
+        groups = read_records()
+        plans, skipped = plan_merges(groups)
+        n_dups = sum(len(p["merge"]) for p in plans)
+        print(f"{len(groups)} Etsy buyers; {len(plans) + len(skipped)} are split across several customer records.")
+        print(f"Can be merged safely: {len(plans)} buyers ({n_dups} duplicate records). Left for you to check by hand: {len(skipped)}.\n")
     for p in plans:
         keep = p["keep"]
         print(f"  KEEP  #{short(keep['id'])} {keep['name']} (since {keep['created'][:10]}, {keep['orders']} order(s), has email)")

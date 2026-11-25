@@ -286,6 +286,7 @@ Postage upgrades are detected from the name of the Etsy shipping upgrade the buy
 | `backfill_orders.py` | Downloads past Etsy orders into the database |
 | `backfill_customer_emails.py` | One-off: adds captured buyer emails to the Shopify customers of already-dispatched orders (rehearsal by default; `--apply`, `--limit N`) |
 | `merge_duplicate_customers.py` | Merges Shopify customer records of the same Etsy buyer (same buyer id, surname and postcode) into the record that holds the email. Rehearsal by default; `--apply`, `--limit N`. Needs the app permissions `read_customer_merge` and `write_customer_merge`; merging cannot be undone |
+| `merge_duplicate_customers.py --placeholders` | Instead merges an OrderBridge placeholder customer into the customer that already holds that buyer's real email (same surname and postcode). Same rehearsal-first rules (`--apply`, `--limit N`); merging cannot be undone |
 | `replace_placeholder_emails.py` | One-off: replaces the made-up `etsy-<number>@placeholder.orderbridge.app` emails that the old OrderBridge tool put on Shopify customers with the buyer's real captured email. Rehearsal by default; `--apply`, `--limit N`. Customers only; never touches marketing consent; skips subscribed customers |
 | `reports.py` | Reports and CSV export |
 | `email_server.py`, `email_capture/` (own README) | Optional: local listener and Chrome extension that save buyer emails shown on your Etsy Orders pages |
