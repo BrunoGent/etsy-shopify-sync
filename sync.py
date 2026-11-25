@@ -795,10 +795,6 @@ def set_shopify_fulfill_by(shopify_order_id, fulfill_by_iso):
         print(f"  [!] Failed to set 'Fulfill by' deadline ({g_resp.status_code}): {g_resp.text}")
 
 
-WEIGHT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(kg|kilo|g|gram|lb|oz)", re.I)
-WEIGHT_UNITS = {"kg": 1000, "kilo": 1000, "g": 1, "gram": 1, "lb": 453.592, "oz": 28.3495}
-
-
 def load_sku_weights():
     """Optional sku_weights.json {"SKU": grams}: a fixed weight for a SKU, used before anything else."""
     try:
@@ -810,25 +806,8 @@ def load_sku_weights():
 
 def item_weight_grams(tx, sku):
     """Weight in grams of one unit for an item that is not linked to a Shopify product (those use the
-    product's own weight). Order: sku_weights.json, Etsy's item weight, then an Etsy option such as
-    'Weight: 1 Kg' or '500g'. Returns 0 when unknown."""
-    fixed = load_sku_weights()
-    if sku.strip().lower() in fixed:  # not case sensitive
-        return int(round(fixed[sku.strip().lower()]))
-    try:
-        w = float(tx.get("item_weight") or 0)
-    except (TypeError, ValueError):
-        w = 0
-    unit = str(tx.get("item_weight_unit") or "").lower()
-    if w > 0 and unit in WEIGHT_UNITS:
-        return int(round(w * WEIGHT_UNITS[unit]))
-    for var in tx.get("variations", []):
-        text = f"{var.get('formatted_name') or var.get('property_name') or ''} {var.get('formatted_value') or var.get('value') or ''}"
-        if "weight" in text.lower() or "size" in text.lower():
-            m = WEIGHT_RE.search(text.replace("Weight", ""))
-            if m:
-                return int(round(float(m.group(1).replace(",", ".")) * WEIGHT_UNITS[m.group(2).lower()]))
-    return 0
+    product's own weight), from sku_weights.json only. Returns 0 when the SKU is not listed."""
+    return int(round(load_sku_weights().get(sku.strip().lower(), 0)))
 
 
 def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
@@ -1282,7 +1261,11 @@ def import_etsy_orders(args):
             o_data["tags"] = f"{o_data['tags']}, {NI_TAG}"
         unlinked = [i.get("sku", "no SKU") for i in o_data["line_items"] if "variant_id" not in i]
         for i in o_data["line_items"]:
-            if "variant_id" not in i and not i.get("grams"):
+            if "variant_id" in i:
+                continue
+            if i.get("grams"):
+                print(f"  [i] Weight {i['grams']} g set for SKU '{i.get('sku')}' (from sku_weights.json).")
+            else:
                 UNWEIGHTED_ITEMS.append((receipt_id, i.get("sku") or "no SKU", i.get("title", "")))
         c_name = f"{o_data['customer']['first_name']} {o_data['customer']['last_name']}"
 
