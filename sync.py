@@ -1754,6 +1754,14 @@ def print_email_coverage():
         print(f"  ... and {len(without) - 10} more")
 
 
+ORDER_EMAILS_QUERY = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Order { id email customer { id defaultEmailAddress { emailAddress } } }
+  }
+}"""
+
+
 def fill_missing_shopify_emails(dry_run=False):
     """Open orders imported before the buyer's email was captured: put the captured email on the Shopify
     order and its customer. Only fills a blank (never overwrites), and never touches marketing consent:
@@ -1770,18 +1778,30 @@ def fill_missing_shopify_emails(dry_run=False):
         SELECT etsy_receipt_id, shopify_order_id, buyer_user_id FROM synced_orders
         WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0""")
     added = failed = shared = 0
+    todo = []
     for rid, shopify_id, uid in rows:
         email = (by_receipt.get(str(rid)) or by_buyer.get(str(uid)) or "").strip()
         sid = _numeric_id(shopify_id)
-        if not email or not sid:
-            continue
+        if email and sid:
+            todo.append((rid, sid, email))
+    # One GraphQL request reads up to 100 orders at once (it used to be one request per order: about 14 s for 25 orders).
+    current = {}
+    for i in range(0, len(todo), 100):
+        data = shopify_graphql(ORDER_EMAILS_QUERY, {"ids": [f"gid://shopify/Order/{sid}" for _, sid, _ in todo[i:i + 100]]})
+        for node in data.get("nodes") or []:
+            if node:
+                cust = node.get("customer") or {}
+                current[node["id"].rsplit("/", 1)[1]] = {
+                    "email": node.get("email") or "",
+                    "customer": {"id": cust["id"].rsplit("/", 1)[1] if cust.get("id") else None,
+                                 "email": ((cust.get("defaultEmailAddress") or {}).get("emailAddress")) or ""}}
+    for rid, sid, email in todo:
         url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders/{sid}.json"
-        resp = shopify_request("GET", url, params={"fields": "id,email,customer"})
-        if resp.status_code != 200:
+        order = current.get(sid)
+        if order is None:
             failed += 1
-            print(f"  [!] Could not read Shopify order for Etsy #{rid} ({resp.status_code}).")
+            print(f"  [!] Could not read Shopify order for Etsy #{rid}.")
             continue
-        order = resp.json().get("order", {})
         if (order.get("email") or "").strip():
             if not dry_run:
                 _db_execute("UPDATE synced_orders SET buyer_email = ? WHERE etsy_receipt_id = ?", (email, str(rid)))
