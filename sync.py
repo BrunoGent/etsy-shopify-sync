@@ -651,6 +651,7 @@ def save_order_details(receipt):
 
 
 REPEAT_TAG = "Repeat customer"
+COMBINE_TAG = "Combine"
 REPEAT_ORDER_TAG = "Repeat order"   # followed by the order number, e.g. "Repeat order 3"
 
 
@@ -1673,6 +1674,54 @@ def print_email_coverage():
         print(f"  ... and {len(without) - 10} more")
 
 
+def find_combinable_orders():
+    """Groups of open (imported, not yet dispatched) orders from the same buyer going to the same address.
+    Returns a list of groups; each group is a list of (receipt_id, shopify_order_id, name, items)."""
+    rows = _db_query("""
+        SELECT etsy_receipt_id, shopify_order_id, buyer_user_id, buyer_name, postcode, country, items, order_date
+        FROM synced_orders
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
+        ORDER BY order_date""")
+    groups = {}
+    for rid, shopify_id, uid, name, post, country, items, _date in rows:
+        post = (post or "").replace(" ", "").upper()
+        if not post:
+            continue  # no address to compare: never guess
+        who = str(uid) if uid else (name or "").strip().lower()
+        groups.setdefault((who, post, (country or "").strip().lower()), []).append(
+            (str(rid), shopify_id, (name or "").strip() or "unknown buyer", items or ""))
+    return [g for g in groups.values() if len(g) > 1]
+
+
+def report_combinable_orders(dry_run=False):
+    """Tags and lists open orders that could go in one parcel with one label (postage is free on every
+    order, so the second order needs no extra postage). A reminder only: nothing is combined automatically."""
+    groups = find_combinable_orders()
+    if not groups:
+        return
+    line = "=" * 74
+    print("\n" + paint(line, "yellow"))
+    print(paint(f"  COMBINE: {len(groups)} customer(s) with more than one open order to the same address", "yellow"))
+    print("  Buy ONE label, put both orders in the parcel, then give the same tracking number to both.")
+    print()
+    for group in groups:
+        print(f"    {group[0][2]}")
+        for rid, shopify_id, _name, items in group:
+            first = (items.splitlines() or [""])[0][:48]
+            print(f"      Etsy #{rid}  {first}")
+        if not dry_run:
+            for rid, shopify_id, _name, _items in group:
+                sid = _numeric_id(shopify_id)
+                if not sid:
+                    continue
+                others = ", ".join(f"#{r}" for r, *_ in group if r != rid)
+                add_shopify_order_tag(sid, COMBINE_TAG)
+                add_shopify_order_tag(sid, f"{COMBINE_TAG} with {others}")
+    print()
+    print("  (Tagged 'Combine' in Shopify. Listed until they are dispatched on Etsy.)")
+    print(paint(line, "yellow"))
+
+
 def print_gift_messages():
     """Lists imported orders that carry a gift message and are not yet dispatched, as a reminder to
     print the gift message from Etsy (Etsy generates that A4 page; this program cannot)."""
@@ -1759,6 +1808,7 @@ def main(argv=None):
         print_run_summary()
         print_due_orders()
         print_email_coverage()
+        report_combinable_orders(dry_run=args.dry_run)
         print_gift_messages()
         print_ni_banner()
     except Exception:
