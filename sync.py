@@ -1683,10 +1683,12 @@ def fill_missing_shopify_emails(dry_run=False):
     except sqlite3.Error:
         by_buyer = {}
     by_receipt = {str(r[0]): r[1] for r in _db_query("SELECT receipt_id, email FROM etsy_emails WHERE email <> ''")}
+    # Every open order is checked against SHOPIFY itself (below). The local buyer_email column cannot be the test:
+    # the import part of a run copies captured emails into it first, which used to make this step skip the very
+    # orders it was meant to fill (Shopify stayed blank while the database said "has email").
     rows = _db_query("""
         SELECT etsy_receipt_id, shopify_order_id, buyer_user_id FROM synced_orders
-        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0
-          AND COALESCE(buyer_email, '') = ''""")
+        WHERE status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY') AND COALESCE(tracking_pushed, 0) = 0""")
     added = failed = shared = 0
     for rid, shopify_id, uid in rows:
         email = (by_receipt.get(str(rid)) or by_buyer.get(str(uid)) or "").strip()
