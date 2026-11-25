@@ -946,6 +946,60 @@ def push_to_shopify(order_payload):
     return resp.json().get("order", {})
 
 
+PRIOR_CUSTOMERS_QUERY = """
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Order { id customer { id lastName createdAt
+                                 defaultEmailAddress { emailAddress }
+                                 defaultAddress { zip } } }
+  }
+}"""
+
+
+def find_existing_customer(receipt, buyer_email=""):
+    """The Shopify customer an Etsy buyer already has, so a repeat order joins it instead of creating a duplicate.
+
+    Looks at the buyer's earlier imported orders (same Etsy buyer id, from orders.db) and reads their customers
+    from Shopify. A customer is only used when it is safely the same person: same surname AND same postcode as
+    this order, and no different email on either side. If there are several (unmerged duplicates), the oldest
+    one holding an email is preferred. Returns the numeric customer id, or None (the order then creates a new
+    customer exactly as before)."""
+    uid = str(receipt.get("buyer_user_id") or "").strip()
+    if not uid:
+        return None
+    rows = _db_query("""
+        SELECT shopify_order_id FROM synced_orders
+        WHERE buyer_user_id = ? AND shopify_order_id GLOB '[0-9]*' AND status IN ('SUCCESS', 'EXISTING_IN_SHOPIFY', 'SHIPPED')
+        ORDER BY order_date DESC LIMIT 10""", (uid,))
+    if not rows:
+        return None
+    data = shopify_graphql(PRIOR_CUSTOMERS_QUERY, {"ids": [f"gid://shopify/Order/{r[0]}" for r in rows]})
+    parts = (receipt.get("name") or "").split()
+    want_last = " ".join(parts[1:]).strip().lower() if len(parts) > 1 else ""
+    want_zip = "".join(str(receipt.get("zip") or "").split()).upper()
+    want_email = (buyer_email or "").strip().lower()
+    if not want_last or not want_zip:
+        return None
+    found = {}
+    for node in data.get("nodes") or []:
+        c = (node or {}).get("customer")
+        if not c:
+            continue
+        email = ((c.get("defaultEmailAddress") or {}).get("emailAddress") or "").strip().lower()
+        last = (c.get("lastName") or "").strip().lower()
+        zip_ = "".join(str((c.get("defaultAddress") or {}).get("zip") or "").split()).upper()
+        if last != want_last or zip_ != want_zip:
+            continue                                       # a gift to someone else, or a different address
+        found[c["id"]] = (0 if email else 1, c.get("createdAt") or "", c["id"], email)
+    if not found:
+        return None
+    emails = {v[3] for v in found.values() if v[3]}
+    if len(emails) > 1 or (want_email and emails and want_email not in emails):
+        return None                                        # two different emails in play: not safely the same person
+    best = sorted(found.values())[0]                       # holds an email first, then the oldest
+    return best[2].rsplit("/", 1)[1]
+
+
 def _numeric_id(value):
     """Returns a stored Shopify order ID if it is a real one (not a placeholder like CANCELLED_ON_ETSY)."""
     value = str(value or "")
@@ -1104,6 +1158,7 @@ def import_etsy_orders(args):
     print(f"Found {len(orders)} active unshipped/paid receipt(s) on Etsy.")
 
     created_count, backfilled_count, skipped_existing, failed_import = 0, 0, 0, 0
+    linked_count = 0
     cancelled_after_import = sum(
         1 for r in cancelled if handle_cancelled_receipt(r, existing_shopify_map, args.dry_run))
 
@@ -1155,9 +1210,21 @@ def import_etsy_orders(args):
         if hold_ni:
             o_data["tags"] = f"{o_data['tags']}, {NI_TAG}"
         unlinked = [i.get("sku", "no SKU") for i in o_data["line_items"] if "variant_id" not in i]
+        c_name = f"{o_data['customer']['first_name']} {o_data['customer']['last_name']}"
+
+        # A repeat buyer joins their existing Shopify customer instead of getting a duplicate record.
+        new_customer, linked_to = o_data["customer"], None
+        if getattr(args, "link_customers", True):
+            try:
+                linked_to = find_existing_customer(receipt, o_data.get("email", ""))
+            except Exception as e:
+                print(f"  [i] Could not look for an existing Shopify customer ({e}); a new customer will be created.")
+            if linked_to:
+                o_data["customer"] = {"id": int(linked_to)}    # consent and details of that customer stay as they are
 
         if args.dry_run:
-            c_name = f"{o_data['customer']['first_name']} {o_data['customer']['last_name']}"
+            if linked_to:
+                print(f"  [DRY RUN] Would attach this order to the buyer's existing Shopify customer #{linked_to} (same Etsy buyer, surname and postcode).")
             print(f"  [DRY RUN] Order Name: #{o_data['name']} | Customer: {c_name} | Total: £{o_data['transactions'][0]['amount']}")
             print(f"  [DRY RUN] Purchase Time (processed_at): {processed_at_iso} | Fulfill By: {fulfill_by_iso}")
             print(f"  [DRY RUN] Tags: {o_data['tags']}")
@@ -1175,12 +1242,23 @@ def import_etsy_orders(args):
             continue
 
         try:
-            created_order = push_to_shopify(payload)
+            try:
+                created_order = push_to_shopify(payload)
+            except Exception as e:
+                if not linked_to:
+                    raise
+                # Never let the customer link block an import: create the order the old way instead.
+                print(f"  [i] Shopify would not attach the order to customer #{linked_to} ({e}); creating it with a new customer instead.")
+                o_data["customer"], linked_to = new_customer, None
+                created_order = push_to_shopify(payload)
         except Exception as e:
             print(f"  [!] Failed to push order #{receipt_id}: {e}")
             failed_import += 1
             continue
 
+        if linked_to:
+            linked_count += 1
+            print(f"  [+] Attached the order to the buyer's existing Shopify customer #{linked_to} (same Etsy buyer).")
         shopify_id = created_order.get("id")
         record_synced_order(receipt_id, shopify_id, status="SUCCESS", expected_ship_date=ship_by_date)
         save_order_details(receipt)
@@ -1203,6 +1281,7 @@ def import_etsy_orders(args):
 
     note("Orders in (Etsy -> Shopify)", [
         ("Created", created_count, None), ("Backfilled", backfilled_count, None),
+        ("Joined an existing customer", linked_count, None),
         ("Failed", failed_import, "red"), ("Cancelled after import", cancelled_after_import, "yellow"),
         ("Northern Ireland on hold", len(ni_held_orders) if args.exclude_ni else 0, "yellow")])
 
@@ -1840,6 +1919,8 @@ def main(argv=None):
     parser.add_argument("--force-dispatch", action="store_true", help="Mark orders dispatched on Etsy now, even before their ship-by date.")
     parser.add_argument("--exclude-ni", "--excludeNI", "--hold-ni", dest="exclude_ni", action="store_true",
                         help="Import orders going to Northern Ireland (BT postcodes) ON HOLD instead of unfulfilled, and list them so you can dispatch them on Etsy.")
+    parser.add_argument("--no-link-customers", dest="link_customers", action="store_false",
+                        help="Do not attach a repeat Etsy buyer's new order to their existing Shopify customer (new orders then each create a new customer, as before).")
     parser.add_argument("--tag-repeats", action="store_true",
                         help="Tag already-imported, not-yet-dispatched orders from repeat Etsy buyers (Repeat customer, Repeat order N), then exit.")
     args = parser.parse_args(argv)
