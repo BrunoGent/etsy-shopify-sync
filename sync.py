@@ -1339,7 +1339,7 @@ def import_etsy_orders(args):
         record_synced_order(receipt_id, shopify_id, status="SUCCESS", expected_ship_date=ship_by_date)
         save_order_details(receipt)
         created_count += 1
-        print(f"  [+] Created Shopify Order {created_order.get('name')} (ID: {shopify_id}, Purchased: {processed_at_iso})")
+        print(f"  [+] Created the Shopify order (Shopify ID: {shopify_id}, purchased: {str(processed_at_iso).replace('T', ' ').rstrip('Z')} UTC)")
         if unlinked:
             print(f"  [!] {len(unlinked)} line item(s) not linked to a Shopify product: {', '.join(unlinked)}")
         if fulfill_by_iso:
