@@ -1458,8 +1458,11 @@ def is_already_shipped_response(resp):
     )
 
 
-def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False):
-    print(f"\n--- Checking Shopify Fulfillments to Dispatch on Etsy (Dry Run: {dry_run}) ---")
+def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False, only_receipt=None):
+    """Pushes Shopify tracking to Etsy. With only_receipt, looks at that one order only."""
+    only_receipt = str(only_receipt).lstrip("#") if only_receipt else None
+    scope = f", only Etsy #{only_receipt}" if only_receipt else ""
+    print(f"\n--- Checking Shopify Fulfillments to Dispatch on Etsy (Dry Run: {dry_run}{scope}) ---")
     url = f"https://{SHOPIFY_SHOP_URL}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
     params = {
         "status": "any",
@@ -1467,7 +1470,13 @@ def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False):
         "limit": 250,
         "fields": "id,name,note,tags,fulfillment_status,fulfillments"
     }
+    if only_receipt:
+        params["name"] = only_receipt
     orders = shopify_get_all(url, params, "orders", max_items=limit)
+    if only_receipt:
+        orders = [o for o in orders if extract_etsy_receipt_id(o) == only_receipt]
+        if not orders:
+            print(f"  [!] Etsy #{only_receipt}: no Shopify order found with that number (Shopify only shows the last 60 days).")
     ensure_etsy_token()
     dispatch_note = load_dispatch_note()
     print(f"Buyer dispatch note: {'ON (dispatch_note.txt)' if dispatch_note else 'off (no dispatch_note.txt)'}")
@@ -1484,12 +1493,16 @@ def sync_tracking_to_etsy(dry_run=False, limit=500, force_dispatch=False):
 
         parcels = collect_parcels(o)
         if not parcels:
+            if only_receipt:
+                print(f"  [-] Etsy #{receipt_id}: no label with a tracking number is on the Shopify order yet. Buy the label first.")
             continue
 
         state = get_tracking_state(receipt_id)
         to_push = [] if state["legacy_done"] else [p for p in parcels if p[0] not in state["codes"]]
         if not to_push:
             skipped_db += 1
+            if only_receipt:
+                print(f"  [-] Etsy #{receipt_id}: tracking was already sent to Etsy. Nothing to do.")
             continue
 
         due = get_dispatch_due_date(receipt_id, o)
@@ -2109,6 +2122,8 @@ def main(argv=None):
     parser.add_argument("--backfill-deadlines", action="store_true", help="Update 'Fulfill by' deadlines on already-imported unshipped orders.")
     parser.add_argument("--tracking-only", action="store_true", help="Only push fulfilled tracking numbers from Shopify to Etsy (default behavior).")
     parser.add_argument("--force-dispatch", action="store_true", help="Mark orders dispatched on Etsy now, even before their ship-by date.")
+    parser.add_argument("--only-receipt", metavar="NUMBER",
+                        help="Send tracking to Etsy for this one order only (add --force-dispatch to ignore the ship-by date).")
     parser.add_argument("--exclude-ni", "--excludeNI", "--hold-ni", dest="exclude_ni", action="store_true",
                         help="Import orders going to Northern Ireland (BT postcodes) ON HOLD instead of unfulfilled, and list them so you can dispatch them on Etsy.")
     parser.add_argument("--no-link-customers", dest="link_customers", action="store_false",
@@ -2123,6 +2138,11 @@ def main(argv=None):
     logfile = start_run_log(sys.argv[1:] if argv is None else argv)
     try:
         init_db()
+        if args.only_receipt:
+            ensure_etsy_token()
+            sync_tracking_to_etsy(dry_run=args.dry_run, force_dispatch=args.force_dispatch, only_receipt=args.only_receipt)
+            print_run_summary()
+            return
         if args.tag_repeats:
             tag_repeat_customers(dry_run=args.dry_run)
             return
