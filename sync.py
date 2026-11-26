@@ -2071,8 +2071,8 @@ def sync_channel_orders(dry_run=False, full=False):
         else:
             channel = o.get("source_name") or "unknown"
             new[channel] = new.get(channel, 0) + 1
-    note("New eBay / web orders saved", [(k, n, None) for k, n in sorted(new.items())])
-    note("eBay / web orders updated", [("Changed since last run", changed, None)])
+    note("Non-Etsy orders found in Shopify (eBay / web shop), copied into the database", [(f"from {k}", n, None) for k, n in sorted(new.items())])
+    note("Non-Etsy orders already in the database, refreshed because they changed in Shopify", [("orders", changed, None)])
 
 
 def backup_database():
