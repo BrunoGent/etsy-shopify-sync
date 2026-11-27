@@ -514,6 +514,17 @@ def clean_receipt(value):
     return value
 
 
+EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2190-\u21FF\u2900-\u297F"
+    "\uFE00-\uFE0F\u200D\u20E3\U000E0020-\U000E007F]+")
+
+
+def strip_emojis(text):
+    """Shopify refuses emojis in names and addresses (422 'cannot contain emojis'); buyers do put hearts in their name.
+    Removes them and tidies the spaces. Used only for names and address lines, never for notes."""
+    return re.sub(r"\s+", " ", EMOJI_RE.sub("", str(text or ""))).strip()
+
+
 def fetch_etsy_receipts(max_receipts=500):
     """Fetches all paid, unshipped Etsy receipts (cancelled ones included), 100 per page."""
     url = f"https://api.etsy.com/v3/application/shops/{ETSY_SHOP_ID}/receipts"
@@ -975,7 +986,7 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
         notes.append(f"Buyer Note:\n{receipt.get('message_from_buyer')}")
 
     # 4. Customer & Shipping Address
-    full_name = (receipt.get("name") or "").strip()
+    full_name = strip_emojis(receipt.get("name"))
     name_parts = full_name.split()
     first_name = name_parts[0] if name_parts else "Etsy"
     last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "."
@@ -983,11 +994,11 @@ def map_etsy_to_shopify(receipt, sku_map=None, batch=None):
     shipping_address = {
         "first_name": first_name,
         "last_name": last_name,
-        "address1": receipt.get("first_line") or "",
-        "address2": receipt.get("second_line") or "",
-        "city": receipt.get("city") or "",
-        "province": receipt.get("state") or "",
-        "zip": receipt.get("zip") or "",
+        "address1": strip_emojis(receipt.get("first_line")),
+        "address2": strip_emojis(receipt.get("second_line")),
+        "city": strip_emojis(receipt.get("city")),
+        "province": strip_emojis(receipt.get("state")),
+        "zip": strip_emojis(receipt.get("zip")),
         "country_code": receipt.get("country_iso") or HOME_COUNTRY,
     }
 

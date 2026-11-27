@@ -38,6 +38,7 @@ Built for a UK shop shipping with Royal Mail, but the carrier names and shipping
 
 - Looks at recent Shopify orders that came from Etsy and have a tracking number.
 - Sends the tracking number and carrier to Etsy, which marks the order dispatched and emails the buyer.
+- **Emojis in names and addresses are removed** before the order is created, because Shopify refuses them (error 422 "cannot contain emojis"). Notes and gift messages keep theirs.
 - **Holds dispatch until the ship-by date.** If you buy labels early, the order is not marked dispatched on Etsy until its Etsy ship-by date. Every run lists what is being held and until when. Use `--force-dispatch` to send everything now.
   - Because the tool only runs when you start it, **you must run it on the ship-by date**, otherwise Etsy will show the order as late.
 - **Never dispatches twice.** Before sending, it asks Etsy whether the order is already dispatched.
