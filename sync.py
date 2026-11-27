@@ -1803,8 +1803,8 @@ RUN_SUMMARY = []  # (section, [(label, count, colour)]) collected during the run
 
 def paint(text, colour):
     """Colours text on the console only; the run log has the codes stripped out again."""
-    if colour not in COLOURS or not sys.__stdout__.isatty():
-        return text
+    if colour not in COLOURS or not (sys.__stdout__.isatty() or os.environ.get("BEEMINE_COLOUR")):
+        return text   # BEEMINE_COLOUR: the Beemine window asks for the codes and draws them itself
     return f"\x1b[{COLOURS[colour]}m{text}\x1b[0m"
 
 
