@@ -55,6 +55,7 @@ CANCELLED_TAG = "Etsy Cancelled"
 # as Etsy described it. The only decision made from them is the repeat-customer flag
 # (previous_order_count: buyer_user_id, or name + postcode when that is missing).
 ORDER_DETAIL_COLUMNS = {
+    "is_ni": "INTEGER DEFAULT 0",   # 1 = delivered to Northern Ireland (BT postcode)
     "order_date": "TEXT",          # purchase time, UTC, YYYY-MM-DD HH:MM:SS
     "etsy_status": "TEXT",         # Etsy's own status: Paid, Completed, Canceled, ...
     "buyer_name": "TEXT",
@@ -136,12 +137,35 @@ def init_db():
             )
         """)
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS channel_order_items (
-                shopify_order_id TEXT, line_id TEXT, sku TEXT, title TEXT, variant_title TEXT,
-                quantity INTEGER, unit_price REAL, discount REAL, grams INTEGER,
-                PRIMARY KEY (shopify_order_id, line_id)
+            CREATE TABLE IF NOT EXISTS order_items (
+                channel TEXT,            -- etsy, ebay, web, shopify_draft_order
+                order_ref TEXT,          -- Etsy receipt id, or Shopify order id for other channels
+                line_id TEXT,            -- Etsy transaction id / Shopify line item id
+                order_date TEXT,
+                is_ni INTEGER DEFAULT 0,
+                sku TEXT, title TEXT,
+                options TEXT,            -- size / scent / wick / personalisation, as the buyer chose
+                quantity INTEGER,
+                unit_price REAL,         -- price of one unit, before discount
+                line_total REAL,         -- unit_price x quantity
+                discount REAL,           -- this line's share of the order discount
+                grams INTEGER,
+                PRIMARY KEY (channel, order_ref, line_id)
             )
         """)
+        cursor.execute("PRAGMA table_info(channel_orders)")
+        if "is_ni" not in [c[1] for c in cursor.fetchall()]:
+            cursor.execute("ALTER TABLE channel_orders ADD COLUMN is_ni INTEGER DEFAULT 0")
+        # one-off move of the earlier eBay/web item table into order_items
+        if cursor.execute("SELECT name FROM sqlite_master WHERE name = 'channel_order_items'").fetchone():
+            cursor.execute("""
+                INSERT OR IGNORE INTO order_items (channel, order_ref, line_id, order_date, sku, title, options,
+                                                   quantity, unit_price, line_total, discount, grams)
+                SELECT o.channel, i.shopify_order_id, i.line_id, o.order_date, i.sku, i.title, i.variant_title,
+                       i.quantity, i.unit_price, ROUND(i.unit_price * i.quantity, 2), i.discount, i.grams
+                FROM channel_order_items i JOIN channel_orders o ON o.shopify_order_id = i.shopify_order_id
+            """)
+            cursor.execute("DROP TABLE channel_order_items")
         cursor.execute("PRAGMA table_info(synced_orders)")
         columns = [col[1] for col in cursor.fetchall()]
         migrations = {
@@ -154,6 +178,11 @@ def init_db():
         for name, ddl in migrations.items():
             if name not in columns:
                 cursor.execute(f"ALTER TABLE synced_orders ADD COLUMN {name} {ddl}")
+        ni = "GLOB 'BT[0-9]*'"
+        cursor.execute(f"UPDATE synced_orders SET is_ni = 1 WHERE COALESCE(is_ni, 0) = 0 "
+                       f"AND upper(replace(COALESCE(postcode, ''), ' ', '')) {ni} AND COALESCE(country, 'GB') IN ('GB', '')")
+        cursor.execute(f"UPDATE channel_orders SET is_ni = 1 WHERE COALESCE(is_ni, 0) = 0 "
+                       f"AND upper(replace(COALESCE(postcode, ''), ' ', '')) {ni} AND COALESCE(country, 'GB') IN ('GB', '')")
         conn.commit()
 
 
@@ -641,6 +670,7 @@ def extract_order_details(receipt):
     codes = [str(s.get("tracking_code") or "").strip() for s in shipments]
     email = (receipt.get("buyer_email") or "").strip() or get_cached_email(receipt_id)
     return {
+        "is_ni": 1 if is_northern_ireland(receipt) else 0,
         "order_date": _utc_str(receipt.get("create_timestamp") or receipt.get("created_timestamp")),
         "etsy_status": receipt.get("status"),
         "buyer_name": (receipt.get("name") or "").strip() or None,
@@ -681,6 +711,37 @@ def save_order_details(receipt):
     _db_execute(
         f"UPDATE synced_orders SET {assignments}, details_updated_at = CURRENT_TIMESTAMP WHERE etsy_receipt_id = ?",
         tuple(details.values()) + (str(receipt.get("receipt_id")),))
+    save_etsy_order_items(receipt)
+
+
+def save_etsy_order_items(receipt):
+    """One order_items row per Etsy line (transaction): the per-item record costing needs."""
+    receipt_id = str(receipt.get("receipt_id"))
+    txs = receipt.get("transactions") or []
+    subtotal = sum(parse_money(tx.get("price")) * (tx.get("quantity") or 0) for tx in txs)
+    discount = parse_money(receipt.get("discount_amt") or receipt.get("discount_amount"))
+    when = _utc_str(receipt.get("create_timestamp") or receipt.get("created_timestamp"))
+    ni = 1 if is_northern_ireland(receipt) else 0
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM order_items WHERE channel = 'etsy' AND order_ref = ?", (receipt_id,))
+        for n, tx in enumerate(txs):
+            qty = int(tx.get("quantity") or 0)
+            unit = parse_money(tx.get("price"))
+            total = round(unit * qty, 2)
+            options = []
+            for var in tx.get("variations") or []:
+                value = var.get("formatted_value") or var.get("value") or ""
+                if value:
+                    options.append(f"{var.get('formatted_name') or var.get('property_name') or 'Option'}: {value}")
+            if tx.get("buyer_personalization"):
+                options.append(f"Personalization: {tx.get('buyer_personalization')}")
+            share = round(discount * (unit * qty) / subtotal, 2) if discount and subtotal else 0.0
+            conn.execute(
+                "INSERT INTO order_items (channel, order_ref, line_id, order_date, is_ni, sku, title, options, "
+                "quantity, unit_price, line_total, discount, grams) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("etsy", receipt_id, str(tx.get("transaction_id") or n), when, ni,
+                 (tx.get("sku") or "").strip(), tx.get("title"), "; ".join(options), qty, unit, total, share, None))
+        conn.commit()
 
 
 REPEAT_TAG = "Repeat customer"
@@ -2042,12 +2103,18 @@ def save_channel_order(order):
                      "city, province, postcode, country, items, item_count, items_total, shipping_cost, discount, tax, "
                      "grand_total, refunded, currency, shipping_title, tracking, shipped_date, shopify_updated_at) "
                      "VALUES (" + ",".join("?" * 30) + ")", values)
-        conn.execute("DELETE FROM channel_order_items WHERE shopify_order_id = ?", (sid,))
+        ni = 1 if (re.match(r"BT\d", re.sub(r"\s+", "", str(ship.get("zip") or "")).upper())
+                   and (ship.get("country_code") or HOME_COUNTRY) == HOME_COUNTRY) else 0
+        conn.execute("UPDATE channel_orders SET is_ni = ? WHERE shopify_order_id = ?", (ni, sid))
+        conn.execute("DELETE FROM order_items WHERE channel = ? AND order_ref = ?", (channel, sid))
         for li in lines:
             discount = sum(money(d.get("amount")) for d in li.get("discount_allocations") or [])
-            conn.execute("INSERT INTO channel_order_items VALUES (?,?,?,?,?,?,?,?,?)",
-                         (sid, str(li.get("id")), li.get("sku") or "", li.get("title"), li.get("variant_title"),
-                          li.get("quantity"), money(li.get("price")), discount, li.get("grams")))
+            qty = int(li.get("quantity") or 0)
+            conn.execute("INSERT INTO order_items (channel, order_ref, line_id, order_date, is_ni, sku, title, options, "
+                         "quantity, unit_price, line_total, discount, grams) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (channel, sid, str(li.get("id")), (order.get("created_at") or "")[:19], ni, li.get("sku") or "",
+                          li.get("title"), li.get("variant_title") or "", qty, money(li.get("price")),
+                          round(money(li.get("price")) * qty, 2), discount, li.get("grams")))
         conn.commit()
 
 
